@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("GET /api/profiles", state.handleProfiles)
 	mux.HandleFunc("POST /api/open", state.handleOpenProfile)
 	mux.HandleFunc("GET /api/sessions", state.handleSessions)
+	mux.HandleFunc("DELETE /api/sessions", state.handleClearSessions)
 	mux.Handle("/", staticHandler())
 
 	addr := "127.0.0.1:18080"
@@ -284,6 +285,30 @@ func (s *appState) handleSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
+func (s *appState) handleClearSessions(w http.ResponseWriter, r *http.Request) {
+	cleared := s.clearSessions()
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
+}
+
+func (s *appState) clearSessions() int {
+	s.mu.Lock()
+	sessions := make([]*pprofSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.sessions = make(map[string]*pprofSession)
+	s.mu.Unlock()
+
+	for _, session := range sessions {
+		if session.Cancel != nil {
+			session.Cancel()
+		}
+	}
+
+	log.Printf("已清除 %d 个 pprof 进程", len(sessions))
+	return len(sessions)
+}
+
 func (s *appState) findProfileLocked(id string) (profileFile, bool) {
 	for _, profile := range s.profiles {
 		if profile.ID == id {
@@ -410,7 +435,7 @@ func startPprof(profile profileFile) (*pprofSession, error) {
 
 	url := "http://127.0.0.1:" + strconv.Itoa(port)
 	ctx, cancel := context.WithCancel(context.Background())
-	args := []string{"tool", "pprof", "-http=127.0.0.1:" + strconv.Itoa(port), profile.Path}
+	args := pprofCommandArgs(port, profile.Path)
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -427,6 +452,10 @@ func startPprof(profile profileFile) (*pprofSession, error) {
 	go func() {
 		err := cmd.Wait()
 		if err != nil {
+			if ctx.Err() != nil {
+				log.Printf("pprof 进程已关闭：%s", profile.Path)
+				return
+			}
 			log.Printf("pprof 进程退出：%s，错误：%v", profile.Path, err)
 		}
 	}()
@@ -443,6 +472,11 @@ func startPprof(profile profileFile) (*pprofSession, error) {
 		Cmd:       cmd,
 		Cancel:    cancel,
 	}, nil
+}
+
+func pprofCommandArgs(port int, profilePath string) []string {
+	// pprof 默认会自动打开浏览器；前端已经负责 window.open，这里关闭自动打开以避免重复页面。
+	return []string{"tool", "pprof", "-http=127.0.0.1:" + strconv.Itoa(port), "-no_browser", profilePath}
 }
 
 func freePort() (int, error) {

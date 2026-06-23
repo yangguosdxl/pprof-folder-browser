@@ -58,6 +58,15 @@ button:disabled {
   background: var(--accent-strong);
 }
 
+.danger-btn {
+  color: var(--danger);
+}
+
+.danger-btn:hover {
+  border-color: var(--danger);
+  background: #fff5f5;
+}
+
 .shell {
   width: min(1280px, calc(100vw - 32px));
   margin: 24px auto 40px;
@@ -190,6 +199,21 @@ th {
   font-weight: 600;
 }
 
+.sort-btn {
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-weight: 600;
+  text-align: left;
+}
+
+.sort-btn:hover {
+  border-color: transparent;
+  color: var(--accent);
+}
+
 th:nth-child(1) {
   width: 42%;
 }
@@ -237,6 +261,18 @@ tbody tr:hover {
 .sessions {
   margin-top: 18px;
   padding: 16px;
+}
+
+.sessions-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.sessions-head h2 {
+  margin: 0;
 }
 
 .session-list {

@@ -3,18 +3,26 @@ const state = {
   profiles: [],
   sessions: [],
   filter: "",
+  sort: {
+    field: "",
+    direction: "asc",
+  },
 };
 
-const dirForm = document.querySelector("#dirForm");
-const dirInput = document.querySelector("#dirInput");
-const chooseDirBtn = document.querySelector("#chooseDirBtn");
-const dirList = document.querySelector("#dirList");
-const scanBtn = document.querySelector("#scanBtn");
-const filterInput = document.querySelector("#filterInput");
-const profileRows = document.querySelector("#profileRows");
-const summary = document.querySelector("#summary");
-const sessionList = document.querySelector("#sessionList");
-const logBox = document.querySelector("#logBox");
+const browserDocument = typeof document === "undefined" ? null : document;
+const dirForm = browserDocument?.querySelector("#dirForm");
+const dirInput = browserDocument?.querySelector("#dirInput");
+const chooseDirBtn = browserDocument?.querySelector("#chooseDirBtn");
+const dirList = browserDocument?.querySelector("#dirList");
+const scanBtn = browserDocument?.querySelector("#scanBtn");
+const filterInput = browserDocument?.querySelector("#filterInput");
+const profileRows = browserDocument?.querySelector("#profileRows");
+const summary = browserDocument?.querySelector("#summary");
+const sortNameBtn = browserDocument?.querySelector("#sortNameBtn");
+const sortSizeBtn = browserDocument?.querySelector("#sortSizeBtn");
+const sessionList = browserDocument?.querySelector("#sessionList");
+const clearSessionsBtn = browserDocument?.querySelector("#clearSessionsBtn");
+const logBox = browserDocument?.querySelector("#logBox");
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -52,12 +60,13 @@ function renderDirs() {
 
 function renderProfiles() {
   const keyword = state.filter.trim().toLowerCase();
-  const profiles = state.profiles.filter((profile) => {
+  const profiles = sortProfiles(state.profiles.filter((profile) => {
     if (!keyword) return true;
     return `${profile.name} ${profile.path}`.toLowerCase().includes(keyword);
-  });
+  }));
 
   summary.textContent = `共 ${state.profiles.length} 个文件，当前显示 ${profiles.length} 个`;
+  renderSortControls();
 
   if (profiles.length === 0) {
     profileRows.innerHTML = `<tr><td colspan="5" class="empty-cell">没有匹配的 profile 文件</td></tr>`;
@@ -83,6 +92,8 @@ function renderProfiles() {
 }
 
 function renderSessions() {
+  clearSessionsBtn.disabled = state.sessions.length === 0;
+
   if (state.sessions.length === 0) {
     sessionList.innerHTML = `<div class="empty">尚未打开任何 pprof 页面</div>`;
     return;
@@ -98,6 +109,58 @@ function renderSessions() {
       `,
     )
     .join("");
+}
+
+function renderSortControls() {
+  sortNameBtn.textContent = sortButtonText("name", "文件名");
+  sortSizeBtn.textContent = sortButtonText("size", "大小");
+}
+
+function sortButtonText(field, label) {
+  if (state.sort.field !== field) {
+    return label;
+  }
+  return `${label} ${state.sort.direction === "asc" ? "↑" : "↓"}`;
+}
+
+function sortProfiles(profiles) {
+  return sortProfileList(profiles, state.sort);
+}
+
+function sortProfileList(profiles, sort) {
+  if (!sort.field) {
+    return profiles;
+  }
+
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return [...profiles].sort((left, right) => {
+    let result = 0;
+    if (sort.field === "name") {
+      result = left.name.localeCompare(right.name, "zh-CN", { sensitivity: "base" });
+    } else if (sort.field === "size") {
+      result = left.size - right.size;
+    }
+
+    if (result === 0) {
+      result = left.path.localeCompare(right.path, "zh-CN", { sensitivity: "base" });
+    }
+    return result * direction;
+  });
+}
+
+function toggleSort(field) {
+  state.sort = nextSort(state.sort, field);
+  renderProfiles();
+}
+
+function nextSort(currentSort, field) {
+  if (currentSort.field === field) {
+    return {
+      field,
+      direction: currentSort.direction === "asc" ? "desc" : "asc",
+    };
+  }
+  return { field, direction: "asc" };
 }
 
 async function loadDirs() {
@@ -127,6 +190,22 @@ async function loadSessions() {
   const data = await api("/api/sessions");
   state.sessions = data.sessions || [];
   renderSessions();
+}
+
+async function clearSessions() {
+  clearSessionsBtn.disabled = true;
+  clearSessionsBtn.textContent = "清除中";
+  try {
+    const data = await api("/api/sessions", { method: "DELETE" });
+    log(`已清除 ${data.cleared || 0} 个 pprof 进程`);
+    await loadSessions();
+  } catch (error) {
+    log(error.message);
+    alert(error.message);
+  } finally {
+    clearSessionsBtn.textContent = "清除全部";
+    clearSessionsBtn.disabled = state.sessions.length === 0;
+  }
 }
 
 async function openProfile(id) {
@@ -181,47 +260,57 @@ async function chooseDir() {
   }
 }
 
-dirForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const path = dirInput.value.trim();
-  if (!path) return;
-  try {
-    await addDir(path);
-  } catch (error) {
-    log(error.message);
-    alert(error.message);
-  }
-});
+function boot() {
+  dirForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const path = dirInput.value.trim();
+    if (!path) return;
+    try {
+      await addDir(path);
+    } catch (error) {
+      log(error.message);
+      alert(error.message);
+    }
+  });
 
-dirList.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-remove-dir]");
-  if (!button) return;
-  const path = button.dataset.removeDir;
-  try {
-    const data = await api(`/api/dirs?path=${encodeURIComponent(path)}`, { method: "DELETE" });
-    state.dirs = data.dirs || [];
-    state.profiles = state.profiles.filter((profile) => profile.dir !== path);
-    renderDirs();
+  dirList.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-remove-dir]");
+    if (!button) return;
+    const path = button.dataset.removeDir;
+    try {
+      const data = await api(`/api/dirs?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+      state.dirs = data.dirs || [];
+      state.profiles = state.profiles.filter((profile) => profile.dir !== path);
+      renderDirs();
+      renderProfiles();
+      log(`已移除目录：${path}`);
+    } catch (error) {
+      log(error.message);
+      alert(error.message);
+    }
+  });
+
+  profileRows.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-open-id]");
+    if (!button) return;
+    openProfile(button.dataset.openId);
+  });
+
+  scanBtn.addEventListener("click", scanProfiles);
+  chooseDirBtn.addEventListener("click", chooseDir);
+  clearSessionsBtn.addEventListener("click", clearSessions);
+  sortNameBtn.addEventListener("click", () => toggleSort("name"));
+  sortSizeBtn.addEventListener("click", () => toggleSort("size"));
+  filterInput.addEventListener("input", () => {
+    state.filter = filterInput.value;
     renderProfiles();
-    log(`已移除目录：${path}`);
-  } catch (error) {
-    log(error.message);
-    alert(error.message);
-  }
-});
+  });
 
-profileRows.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-open-id]");
-  if (!button) return;
-  openProfile(button.dataset.openId);
-});
-
-scanBtn.addEventListener("click", scanProfiles);
-chooseDirBtn.addEventListener("click", chooseDir);
-filterInput.addEventListener("input", () => {
-  state.filter = filterInput.value;
+  loadDirs().catch((error) => log(error.message));
+  loadSessions().catch((error) => log(error.message));
   renderProfiles();
-});
+  renderSessions();
+}
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -248,7 +337,13 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-loadDirs().catch((error) => log(error.message));
-loadSessions().catch((error) => log(error.message));
-renderProfiles();
-renderSessions();
+if (browserDocument) {
+  boot();
+}
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    nextSort,
+    sortProfileList,
+  };
+}

@@ -34,8 +34,8 @@
         <table>
           <thead>
             <tr>
-              <th>文件</th>
-              <th>大小</th>
+              <th><button id="sortNameBtn" class="sort-btn" type="button">文件名</button></th>
+              <th><button id="sortSizeBtn" class="sort-btn" type="button">大小</button></th>
               <th>修改时间</th>
               <th>目录</th>
               <th>操作</th>
@@ -46,7 +46,10 @@
       </section>
 
       <section class="sessions">
-        <h2>已打开</h2>
+        <div class="sessions-head">
+          <h2>已打开</h2>
+          <button id="clearSessionsBtn" class="danger-btn" type="button">清除全部</button>
+        </div>
         <div id="sessionList" class="session-list"></div>
       </section>
 
