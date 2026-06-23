@@ -1,0 +1,1 @@
+不使用superpowers或者gsd 技能
