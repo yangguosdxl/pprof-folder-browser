@@ -7,6 +7,7 @@ const state = {
 
 const dirForm = document.querySelector("#dirForm");
 const dirInput = document.querySelector("#dirInput");
+const chooseDirBtn = document.querySelector("#chooseDirBtn");
 const dirList = document.querySelector("#dirList");
 const scanBtn = document.querySelector("#scanBtn");
 const filterInput = document.querySelector("#filterInput");
@@ -143,19 +144,49 @@ async function openProfile(id) {
   }
 }
 
+async function addDir(path) {
+  const data = await api("/api/dirs", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  state.dirs = data.dirs || [];
+  dirInput.value = "";
+  renderDirs();
+  log(`已添加目录：${path}`);
+}
+
+async function chooseDir() {
+  chooseDirBtn.disabled = true;
+  chooseDirBtn.textContent = "选择中";
+  log("正在打开目录选择窗口");
+  try {
+    const data = await api("/api/select-dir", { method: "POST", body: "{}" });
+    if (data.canceled) {
+      log("已取消选择目录");
+      return;
+    }
+    if (!data.path) {
+      log("目录选择窗口没有返回路径");
+      return;
+    }
+    dirInput.value = data.path;
+    // 系统弹窗只负责选路径，添加目录仍复用手动输入的校验和刷新逻辑。
+    await addDir(data.path);
+  } catch (error) {
+    log(error.message);
+    alert(error.message);
+  } finally {
+    chooseDirBtn.disabled = false;
+    chooseDirBtn.textContent = "选择目录";
+  }
+}
+
 dirForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const path = dirInput.value.trim();
   if (!path) return;
   try {
-    const data = await api("/api/dirs", {
-      method: "POST",
-      body: JSON.stringify({ path }),
-    });
-    state.dirs = data.dirs || [];
-    dirInput.value = "";
-    renderDirs();
-    log(`已添加目录：${path}`);
+    await addDir(path);
   } catch (error) {
     log(error.message);
     alert(error.message);
@@ -186,6 +217,7 @@ profileRows.addEventListener("click", (event) => {
 });
 
 scanBtn.addEventListener("click", scanProfiles);
+chooseDirBtn.addEventListener("click", chooseDir);
 filterInput.addEventListener("input", () => {
   state.filter = filterInput.value;
   renderProfiles();

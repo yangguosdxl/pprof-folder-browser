@@ -1,3 +1,5 @@
 .gocache/
 *.exe
+*.exe~
 *.log
+screenshot_*.png

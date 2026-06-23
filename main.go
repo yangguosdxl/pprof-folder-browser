@@ -28,11 +28,17 @@ import (
 var webFiles embed.FS
 
 type appState struct {
-	mu       sync.Mutex
-	dirs     []string
-	profiles []profileFile
-	sessions map[string]*pprofSession
+	mu        sync.Mutex
+	dirs      []string
+	profiles  []profileFile
+	sessions  map[string]*pprofSession
+	selectDir dirSelector
 }
+
+// dirSelector 封装系统目录选择能力，测试中会替换为不会弹窗的实现。
+type dirSelector func(context.Context) (string, error)
+
+var errDirSelectionCanceled = errors.New("已取消选择目录")
 
 type profileFile struct {
 	ID       string `json:"id"`
@@ -67,16 +73,13 @@ type apiError struct {
 }
 
 func main() {
-	state := &appState{
-		dirs:     []string{},
-		profiles: []profileFile{},
-		sessions: make(map[string]*pprofSession),
-	}
+	state := newAppState()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/dirs", state.handleListDirs)
 	mux.HandleFunc("POST /api/dirs", state.handleAddDir)
 	mux.HandleFunc("DELETE /api/dirs", state.handleRemoveDir)
+	mux.HandleFunc("POST /api/select-dir", state.handleSelectDir)
 	mux.HandleFunc("POST /api/scan", state.handleScan)
 	mux.HandleFunc("GET /api/profiles", state.handleProfiles)
 	mux.HandleFunc("POST /api/open", state.handleOpenProfile)
@@ -95,6 +98,15 @@ func staticHandler() http.Handler {
 	}
 	mime.AddExtensionType(".js", "text/javascript; charset=utf-8")
 	return http.FileServer(http.FS(sub))
+}
+
+func newAppState() *appState {
+	return &appState{
+		dirs:      []string{},
+		profiles:  []profileFile{},
+		sessions:  make(map[string]*pprofSession),
+		selectDir: selectDirDialog,
+	}
 }
 
 func logRequest(next http.Handler) http.Handler {
@@ -160,6 +172,34 @@ func (s *appState) handleRemoveDir(w http.ResponseWriter, r *http.Request) {
 	s.dirs = next
 	s.profiles = filterProfilesByDirs(s.profiles, s.dirs)
 	writeJSON(w, http.StatusOK, map[string]any{"dirs": cloneStrings(s.dirs)})
+}
+
+func (s *appState) handleSelectDir(w http.ResponseWriter, r *http.Request) {
+	selector := s.selectDir
+	if selector == nil {
+		selector = selectDirDialog
+	}
+
+	log.Print("正在打开系统目录选择窗口")
+	dir, err := selector(r.Context())
+	if errors.Is(err, errDirSelectionCanceled) {
+		log.Print("已取消选择目录")
+		writeJSON(w, http.StatusOK, map[string]any{"path": "", "canceled": true})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("打开目录选择窗口失败：%v", err))
+		return
+	}
+
+	normalized, err := normalizeDir(dir)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	log.Printf("已选择目录：%s", normalized)
+	writeJSON(w, http.StatusOK, map[string]any{"path": normalized, "canceled": false})
 }
 
 func (s *appState) handleScan(w http.ResponseWriter, r *http.Request) {

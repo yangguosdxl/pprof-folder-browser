@@ -103,8 +103,12 @@ p {
 
 .dir-form {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   gap: 10px;
+}
+
+.dir-form button {
+  white-space: nowrap;
 }
 
 input {
