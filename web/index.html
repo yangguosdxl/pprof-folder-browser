@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>pprof 文件浏览器</title>
+    <link rel="stylesheet" href="/vendor/jstree/themes/default/style.min.css" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
@@ -14,6 +15,17 @@
           <p>加载多个目录，点击 profile 文件后用浏览器打开对应的 go tool pprof Web UI。</p>
         </div>
         <button id="scanBtn" class="primary">扫描</button>
+      </section>
+
+      <section class="tabs-panel" aria-label="页签">
+        <div class="tab-row">
+          <div id="tabList" class="tab-list" role="tablist"></div>
+          <button id="addTabBtn" type="button">新增页签</button>
+        </div>
+        <form id="tabNameForm" class="tab-name-form">
+          <input id="tabNameInput" type="text" placeholder="页签名称" autocomplete="off" aria-label="页签名称" />
+          <button type="submit">保存名称</button>
+        </form>
       </section>
 
       <section class="panel">
@@ -27,22 +39,16 @@
 
       <section class="list-head">
         <input id="filterInput" type="search" placeholder="按文件名或路径过滤" />
-        <div id="summary" class="summary">尚未扫描</div>
+        <div class="list-actions">
+          <button id="sortNameBtn" class="sort-btn" type="button">文件名</button>
+          <button id="sortSizeBtn" class="sort-btn" type="button">大小</button>
+          <div id="summary" class="summary">尚未扫描</div>
+        </div>
       </section>
 
-      <section class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th><button id="sortNameBtn" class="sort-btn" type="button">文件名</button></th>
-              <th><button id="sortSizeBtn" class="sort-btn" type="button">大小</button></th>
-              <th>修改时间</th>
-              <th>目录</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody id="profileRows"></tbody>
-        </table>
+      <section class="tree-wrap">
+        <div id="profileTree" class="profile-tree"></div>
+        <aside id="profileDetail" class="profile-detail"></aside>
       </section>
 
       <section class="sessions">
@@ -55,6 +61,8 @@
 
       <pre id="logBox" class="log-box"></pre>
     </main>
+    <script src="/vendor/jquery/jquery-3.7.1.min.js"></script>
+    <script src="/vendor/jstree/jstree.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

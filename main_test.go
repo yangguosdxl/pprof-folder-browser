@@ -22,6 +22,172 @@ type clearSessionsResponse struct {
 	Cleared int `json:"cleared"`
 }
 
+type tabsResponse struct {
+	Tabs        []tabSummary `json:"tabs"`
+	ActiveTabID string       `json:"activeTabId"`
+}
+
+type tabResponse struct {
+	Tab tabSummary `json:"tab"`
+}
+
+func Test默认会创建一个页签(t *testing.T) {
+	state := newAppState()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/tabs", nil)
+	state.handleListTabs(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 %d，响应：%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response tabsResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("解析页签列表响应失败：%v", err)
+	}
+	if len(response.Tabs) != 1 {
+		t.Fatalf("页签数量 = %d，期望 1", len(response.Tabs))
+	}
+	if response.ActiveTabID != response.Tabs[0].ID {
+		t.Fatalf("activeTabId = %q，期望 %q", response.ActiveTabID, response.Tabs[0].ID)
+	}
+	if response.Tabs[0].Name != "页签 1" {
+		t.Fatalf("默认页签名称 = %q，期望 %q", response.Tabs[0].Name, "页签 1")
+	}
+}
+
+func Test默认监听零地址(t *testing.T) {
+	t.Setenv(listenAddrEnv, "")
+
+	if listenAddr() != "0.0.0.0:18080" {
+		t.Fatalf("listenAddr = %q，期望 %q", listenAddr(), "0.0.0.0:18080")
+	}
+}
+
+func Test监听地址支持环境变量覆盖(t *testing.T) {
+	t.Setenv(listenAddrEnv, "0.0.0.0:18081")
+
+	if listenAddr() != "0.0.0.0:18081" {
+		t.Fatalf("listenAddr = %q，期望 %q", listenAddr(), "0.0.0.0:18081")
+	}
+}
+
+func Test可以新增页签并保存改名到服务器状态(t *testing.T) {
+	state := newAppState()
+
+	createRecorder := httptest.NewRecorder()
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/tabs", strings.NewReader(`{}`))
+	state.handleCreateTab(createRecorder, createRequest)
+
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("创建页签状态码 = %d，期望 %d，响应：%s", createRecorder.Code, http.StatusCreated, createRecorder.Body.String())
+	}
+
+	var created tabResponse
+	if err := json.NewDecoder(createRecorder.Body).Decode(&created); err != nil {
+		t.Fatalf("解析创建页签响应失败：%v", err)
+	}
+	if created.Tab.Name != "页签 2" {
+		t.Fatalf("新增页签名称 = %q，期望 %q", created.Tab.Name, "页签 2")
+	}
+
+	body, err := json.Marshal(renameTabRequest{ID: created.Tab.ID, Name: "线上 CPU"})
+	if err != nil {
+		t.Fatalf("序列化改名请求失败：%v", err)
+	}
+	renameRecorder := httptest.NewRecorder()
+	renameRequest := httptest.NewRequest(http.MethodPatch, "/api/tabs", bytes.NewReader(body))
+	state.handleRenameTab(renameRecorder, renameRequest)
+
+	if renameRecorder.Code != http.StatusOK {
+		t.Fatalf("改名状态码 = %d，期望 %d，响应：%s", renameRecorder.Code, http.StatusOK, renameRecorder.Body.String())
+	}
+
+	listRecorder := httptest.NewRecorder()
+	listRequest := httptest.NewRequest(http.MethodGet, "/api/tabs", nil)
+	state.handleListTabs(listRecorder, listRequest)
+
+	var listed tabsResponse
+	if err := json.NewDecoder(listRecorder.Body).Decode(&listed); err != nil {
+		t.Fatalf("解析页签列表响应失败：%v", err)
+	}
+	if len(listed.Tabs) != 2 {
+		t.Fatalf("页签数量 = %d，期望 2", len(listed.Tabs))
+	}
+	if listed.Tabs[1].Name != "线上 CPU" {
+		t.Fatalf("服务端保存的页签名 = %q，期望 %q", listed.Tabs[1].Name, "线上 CPU")
+	}
+}
+
+func Test不同页签目录列表相互隔离(t *testing.T) {
+	state := newAppState()
+	firstDir := t.TempDir()
+	secondDir := t.TempDir()
+
+	createRecorder := httptest.NewRecorder()
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/tabs", strings.NewReader(`{}`))
+	state.handleCreateTab(createRecorder, createRequest)
+	var created tabResponse
+	if err := json.NewDecoder(createRecorder.Body).Decode(&created); err != nil {
+		t.Fatalf("解析创建页签响应失败：%v", err)
+	}
+
+	firstBody, err := json.Marshal(addDirRequest{Path: firstDir})
+	if err != nil {
+		t.Fatalf("序列化第一个目录请求失败：%v", err)
+	}
+	firstAdd := httptest.NewRecorder()
+	state.handleAddDir(firstAdd, httptest.NewRequest(http.MethodPost, "/api/dirs", bytes.NewReader(firstBody)))
+	if firstAdd.Code != http.StatusCreated {
+		t.Fatalf("默认页签添加目录状态码 = %d，期望 %d，响应：%s", firstAdd.Code, http.StatusCreated, firstAdd.Body.String())
+	}
+
+	secondBody, err := json.Marshal(addDirRequest{Path: secondDir})
+	if err != nil {
+		t.Fatalf("序列化第二个目录请求失败：%v", err)
+	}
+	secondAdd := httptest.NewRecorder()
+	secondRequest := httptest.NewRequest(http.MethodPost, "/api/dirs?tabId="+created.Tab.ID, bytes.NewReader(secondBody))
+	state.handleAddDir(secondAdd, secondRequest)
+	if secondAdd.Code != http.StatusCreated {
+		t.Fatalf("第二页签添加目录状态码 = %d，期望 %d，响应：%s", secondAdd.Code, http.StatusCreated, secondAdd.Body.String())
+	}
+
+	defaultList := httptest.NewRecorder()
+	state.handleListDirs(defaultList, httptest.NewRequest(http.MethodGet, "/api/dirs", nil))
+	var defaultDirs struct {
+		Dirs []string `json:"dirs"`
+	}
+	if err := json.NewDecoder(defaultList.Body).Decode(&defaultDirs); err != nil {
+		t.Fatalf("解析默认页签目录响应失败：%v", err)
+	}
+
+	secondList := httptest.NewRecorder()
+	state.handleListDirs(secondList, httptest.NewRequest(http.MethodGet, "/api/dirs?tabId="+created.Tab.ID, nil))
+	var secondDirs struct {
+		Dirs []string `json:"dirs"`
+	}
+	if err := json.NewDecoder(secondList.Body).Decode(&secondDirs); err != nil {
+		t.Fatalf("解析第二页签目录响应失败：%v", err)
+	}
+
+	expectedFirst, err := filepath.Abs(firstDir)
+	if err != nil {
+		t.Fatalf("计算第一个目录绝对路径失败：%v", err)
+	}
+	expectedSecond, err := filepath.Abs(secondDir)
+	if err != nil {
+		t.Fatalf("计算第二个目录绝对路径失败：%v", err)
+	}
+	if len(defaultDirs.Dirs) != 1 || defaultDirs.Dirs[0] != expectedFirst {
+		t.Fatalf("默认页签目录 = %#v，期望只包含 %q", defaultDirs.Dirs, expectedFirst)
+	}
+	if len(secondDirs.Dirs) != 1 || secondDirs.Dirs[0] != expectedSecond {
+		t.Fatalf("第二页签目录 = %#v，期望只包含 %q", secondDirs.Dirs, expectedSecond)
+	}
+}
+
 func Test选择目录接口成功返回规范化路径(t *testing.T) {
 	dir := t.TempDir()
 	state := newAppState()
@@ -151,12 +317,12 @@ func Test选择目录后可以继续添加目录(t *testing.T) {
 func Test清除所有Pprof会话会取消进程并清空列表(t *testing.T) {
 	state := newAppState()
 	canceled := 0
-	state.sessions["one"] = &pprofSession{
+	state.tabs[0].Sessions["one"] = &pprofSession{
 		ID:     "one",
 		Cmd:    &exec.Cmd{},
 		Cancel: func() { canceled++ },
 	}
-	state.sessions["two"] = &pprofSession{
+	state.tabs[0].Sessions["two"] = &pprofSession{
 		ID:     "two",
 		Cmd:    &exec.Cmd{},
 		Cancel: func() { canceled++ },
@@ -180,14 +346,14 @@ func Test清除所有Pprof会话会取消进程并清空列表(t *testing.T) {
 	if canceled != 2 {
 		t.Fatalf("取消次数 = %d，期望 2", canceled)
 	}
-	if len(state.sessions) != 0 {
-		t.Fatalf("剩余会话数 = %d，期望 0", len(state.sessions))
+	if len(state.tabs[0].Sessions) != 0 {
+		t.Fatalf("剩余会话数 = %d，期望 0", len(state.tabs[0].Sessions))
 	}
 }
 
 func Test清除Pprof会话接口链路可刷新为空列表(t *testing.T) {
 	state := newAppState()
-	state.sessions["active"] = &pprofSession{
+	state.tabs[0].Sessions["active"] = &pprofSession{
 		ID:     "active",
 		URL:    "http://127.0.0.1:12345",
 		Cmd:    &exec.Cmd{},
@@ -247,11 +413,30 @@ func TestPprof启动参数禁用自动打开浏览器(t *testing.T) {
 	expected := []string{
 		"tool",
 		"pprof",
-		"-http=127.0.0.1:38080",
+		"-http=0.0.0.0:38080",
 		"-no_browser",
 		`D:\profiles\heap.pprof`,
 	}
 	if strings.Join(args, "\n") != strings.Join(expected, "\n") {
 		t.Fatalf("pprof 启动参数 = %#v，期望 %#v", args, expected)
+	}
+}
+
+func TestPprof页面URL使用当前请求Host(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:18080/api/sessions", nil)
+	url := pprofWebURL(publicHostFromRequest(request), 38080)
+
+	if url != "http://192.168.1.10:38080" {
+		t.Fatalf("pprof URL = %q，期望 %q", url, "http://192.168.1.10:38080")
+	}
+}
+
+func TestPprof页面URL遇到零地址时回退本机地址(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	request.Host = "0.0.0.0:18080"
+	url := pprofWebURL(publicHostFromRequest(request), 38080)
+
+	if url != "http://127.0.0.1:38080" {
+		t.Fatalf("pprof URL = %q，期望 %q", url, "http://127.0.0.1:38080")
 	}
 }

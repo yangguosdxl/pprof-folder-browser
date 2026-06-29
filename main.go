@@ -28,17 +28,37 @@ import (
 var webFiles embed.FS
 
 type appState struct {
-	mu        sync.Mutex
-	dirs      []string
-	profiles  []profileFile
-	sessions  map[string]*pprofSession
-	selectDir dirSelector
+	mu            sync.Mutex
+	tabs          []*browserTab
+	nextTabNumber int
+	selectDir     dirSelector
 }
 
 // dirSelector 封装系统目录选择能力，测试中会替换为不会弹窗的实现。
 type dirSelector func(context.Context) (string, error)
 
 var errDirSelectionCanceled = errors.New("已取消选择目录")
+
+const (
+	defaultListenAddr  = "0.0.0.0:18080"
+	listenAddrEnv      = "PPROF_FOLDER_BROWSER_ADDR"
+	pprofListenHost    = "0.0.0.0"
+	pprofFallbackHost  = "127.0.0.1"
+	defaultTabNameBase = "页签"
+)
+
+type browserTab struct {
+	ID       string                   `json:"id"`
+	Name     string                   `json:"name"`
+	Dirs     []string                 `json:"-"`
+	Profiles []profileFile            `json:"-"`
+	Sessions map[string]*pprofSession `json:"-"`
+}
+
+type tabSummary struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
 
 type profileFile struct {
 	ID       string `json:"id"`
@@ -64,6 +84,15 @@ type addDirRequest struct {
 	Path string `json:"path"`
 }
 
+type createTabRequest struct {
+	Name string `json:"name"`
+}
+
+type renameTabRequest struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type openProfileRequest struct {
 	ID string `json:"id"`
 }
@@ -76,6 +105,9 @@ func main() {
 	state := newAppState()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/tabs", state.handleListTabs)
+	mux.HandleFunc("POST /api/tabs", state.handleCreateTab)
+	mux.HandleFunc("PATCH /api/tabs", state.handleRenameTab)
 	mux.HandleFunc("GET /api/dirs", state.handleListDirs)
 	mux.HandleFunc("POST /api/dirs", state.handleAddDir)
 	mux.HandleFunc("DELETE /api/dirs", state.handleRemoveDir)
@@ -87,7 +119,7 @@ func main() {
 	mux.HandleFunc("DELETE /api/sessions", state.handleClearSessions)
 	mux.Handle("/", staticHandler())
 
-	addr := "127.0.0.1:18080"
+	addr := listenAddr()
 	log.Printf("pprof 文件浏览器已启动：http://%s", addr)
 	log.Fatal(http.ListenAndServe(addr, logRequest(mux)))
 }
@@ -102,12 +134,30 @@ func staticHandler() http.Handler {
 }
 
 func newAppState() *appState {
+	defaultTab := newBrowserTab("tab-1", defaultTabNameBase+" 1")
 	return &appState{
-		dirs:      []string{},
-		profiles:  []profileFile{},
-		sessions:  make(map[string]*pprofSession),
-		selectDir: selectDirDialog,
+		tabs:          []*browserTab{defaultTab},
+		nextTabNumber: 2,
+		selectDir:     selectDirDialog,
 	}
+}
+
+func newBrowserTab(id string, name string) *browserTab {
+	return &browserTab{
+		ID:       id,
+		Name:     name,
+		Dirs:     []string{},
+		Profiles: []profileFile{},
+		Sessions: make(map[string]*pprofSession),
+	}
+}
+
+func listenAddr() string {
+	addr := strings.TrimSpace(os.Getenv(listenAddrEnv))
+	if addr == "" {
+		return defaultListenAddr
+	}
+	return addr
 }
 
 func logRequest(next http.Handler) http.Handler {
@@ -118,10 +168,88 @@ func logRequest(next http.Handler) http.Handler {
 	})
 }
 
+func (s *appState) handleListTabs(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	activeTabID := ""
+	if len(s.tabs) > 0 {
+		activeTabID = s.tabs[0].ID
+	}
+	tabs := cloneTabs(s.tabs)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tabs":        tabs,
+		"activeTabId": activeTabID,
+	})
+}
+
+func (s *appState) handleCreateTab(w http.ResponseWriter, r *http.Request) {
+	var req createTabRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+			return
+		}
+	}
+
+	s.mu.Lock()
+	tabNumber := s.nextTabNumber
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = fmt.Sprintf("%s %d", defaultTabNameBase, tabNumber)
+	}
+	tab := newBrowserTab(fmt.Sprintf("tab-%d", tabNumber), name)
+	s.nextTabNumber++
+	s.tabs = append(s.tabs, tab)
+	responseTab := cloneTab(tab)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusCreated, map[string]any{"tab": responseTab})
+}
+
+func (s *appState) handleRenameTab(w http.ResponseWriter, r *http.Request) {
+	var req renameTabRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, "缺少页签 ID")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "页签名称不能为空")
+		return
+	}
+
+	s.mu.Lock()
+	tab, ok := s.findTabLocked(req.ID)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	tab.Name = req.Name
+	responseTab := cloneTab(tab)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"tab": responseTab})
+}
+
 func (s *appState) handleListDirs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"dirs": cloneStrings(s.dirs)})
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	dirs := cloneStrings(tab.Dirs)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"dirs": dirs})
 }
 
 func (s *appState) handleAddDir(w http.ResponseWriter, r *http.Request) {
@@ -138,16 +266,26 @@ func (s *appState) handleAddDir(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, existing := range s.dirs {
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	for _, existing := range tab.Dirs {
 		if strings.EqualFold(existing, dir) {
-			writeJSON(w, http.StatusOK, map[string]any{"dirs": cloneStrings(s.dirs)})
+			dirs := cloneStrings(tab.Dirs)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"dirs": dirs})
 			return
 		}
 	}
-	s.dirs = append(s.dirs, dir)
-	sort.Strings(s.dirs)
-	writeJSON(w, http.StatusCreated, map[string]any{"dirs": cloneStrings(s.dirs)})
+	tab.Dirs = append(tab.Dirs, dir)
+	sort.Strings(tab.Dirs)
+	dirs := cloneStrings(tab.Dirs)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusCreated, map[string]any{"dirs": dirs})
 }
 
 func (s *appState) handleRemoveDir(w http.ResponseWriter, r *http.Request) {
@@ -163,16 +301,24 @@ func (s *appState) handleRemoveDir(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := s.dirs[:0]
-	for _, existing := range s.dirs {
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	next := tab.Dirs[:0]
+	for _, existing := range tab.Dirs {
 		if !strings.EqualFold(existing, normalized) {
 			next = append(next, existing)
 		}
 	}
-	s.dirs = next
-	s.profiles = filterProfilesByDirs(s.profiles, s.dirs)
-	writeJSON(w, http.StatusOK, map[string]any{"dirs": cloneStrings(s.dirs)})
+	tab.Dirs = next
+	tab.Profiles = filterProfilesByDirs(tab.Profiles, tab.Dirs)
+	dirs := cloneStrings(tab.Dirs)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"dirs": dirs})
 }
 
 func (s *appState) handleSelectDir(w http.ResponseWriter, r *http.Request) {
@@ -205,7 +351,14 @@ func (s *appState) handleSelectDir(w http.ResponseWriter, r *http.Request) {
 
 func (s *appState) handleScan(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	dirs := append([]string(nil), s.dirs...)
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	tabID := tab.ID
+	dirs := append([]string(nil), tab.Dirs...)
 	s.mu.Unlock()
 
 	profiles, err := scanProfiles(dirs)
@@ -215,7 +368,13 @@ func (s *appState) handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.profiles = profiles
+	tab, ok = s.findTabLocked(tabID)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	tab.Profiles = profiles
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles, "count": len(profiles)})
@@ -223,8 +382,16 @@ func (s *appState) handleScan(w http.ResponseWriter, r *http.Request) {
 
 func (s *appState) handleProfiles(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": cloneProfiles(s.profiles)})
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	profiles := cloneProfiles(tab.Profiles)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles})
 }
 
 func (s *appState) handleOpenProfile(w http.ResponseWriter, r *http.Request) {
@@ -239,15 +406,22 @@ func (s *appState) handleOpenProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	profile, ok := s.findProfileLocked(req.ID)
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	tabID := tab.ID
+	profile, ok := findProfile(tab.Profiles, req.ID)
 	if !ok {
 		s.mu.Unlock()
 		writeError(w, http.StatusNotFound, "没有找到这个 profile 文件，请重新扫描")
 		return
 	}
-	for _, session := range s.sessions {
+	for _, session := range tab.Sessions {
 		if session.ProfileID == profile.ID {
-			url := session.URL
+			url := sessionURLForHost(session, publicHostFromRequest(r))
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{"url": url, "reused": true})
 			return
@@ -255,14 +429,23 @@ func (s *appState) handleOpenProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	session, err := startPprof(profile)
+	session, err := startPprof(profile, publicHostFromRequest(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	s.mu.Lock()
-	s.sessions[session.ID] = session
+	tab, ok = s.findTabLocked(tabID)
+	if !ok {
+		s.mu.Unlock()
+		if session.Cancel != nil {
+			session.Cancel()
+		}
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	tab.Sessions[session.ID] = session
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"url": session.URL, "reused": false})
@@ -270,33 +453,50 @@ func (s *appState) handleOpenProfile(w http.ResponseWriter, r *http.Request) {
 
 func (s *appState) handleSessions(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	sessions := make([]*pprofSession, 0, len(s.sessions))
-	for id, session := range s.sessions {
-		if session.Cmd.ProcessState != nil && session.Cmd.ProcessState.Exited() {
-			delete(s.sessions, id)
+	tab, ok := s.findTabByRequestLocked(r)
+	if !ok {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+	sessions := make([]*pprofSession, 0, len(tab.Sessions))
+	urlHost := publicHostFromRequest(r)
+	for id, session := range tab.Sessions {
+		if session.Cmd != nil && session.Cmd.ProcessState != nil && session.Cmd.ProcessState.Exited() {
+			delete(tab.Sessions, id)
 			continue
 		}
-		sessions = append(sessions, session)
+		sessions = append(sessions, cloneSessionForHost(session, urlHost))
 	}
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].StartedAt.After(sessions[j].StartedAt)
 	})
+	s.mu.Unlock()
+
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
 func (s *appState) handleClearSessions(w http.ResponseWriter, r *http.Request) {
-	cleared := s.clearSessions()
+	cleared, ok := s.clearSessionsForTab(r.URL.Query().Get("tabId"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
 }
 
-func (s *appState) clearSessions() int {
+func (s *appState) clearSessionsForTab(tabID string) (int, bool) {
 	s.mu.Lock()
-	sessions := make([]*pprofSession, 0, len(s.sessions))
-	for _, session := range s.sessions {
+	tab, ok := s.findTabLocked(tabID)
+	if !ok {
+		s.mu.Unlock()
+		return 0, false
+	}
+	sessions := make([]*pprofSession, 0, len(tab.Sessions))
+	for _, session := range tab.Sessions {
 		sessions = append(sessions, session)
 	}
-	s.sessions = make(map[string]*pprofSession)
+	tab.Sessions = make(map[string]*pprofSession)
 	s.mu.Unlock()
 
 	for _, session := range sessions {
@@ -306,11 +506,48 @@ func (s *appState) clearSessions() int {
 	}
 
 	log.Printf("已清除 %d 个 pprof 进程", len(sessions))
-	return len(sessions)
+	return len(sessions), true
 }
 
-func (s *appState) findProfileLocked(id string) (profileFile, bool) {
-	for _, profile := range s.profiles {
+func (s *appState) clearSessions() int {
+	total := 0
+	s.mu.Lock()
+	tabIDs := make([]string, 0, len(s.tabs))
+	for _, tab := range s.tabs {
+		tabIDs = append(tabIDs, tab.ID)
+	}
+	s.mu.Unlock()
+
+	for _, tabID := range tabIDs {
+		cleared, ok := s.clearSessionsForTab(tabID)
+		if ok {
+			total += cleared
+		}
+	}
+	return total
+}
+
+func (s *appState) findTabByRequestLocked(r *http.Request) (*browserTab, bool) {
+	return s.findTabLocked(r.URL.Query().Get("tabId"))
+}
+
+func (s *appState) findTabLocked(id string) (*browserTab, bool) {
+	if id == "" {
+		if len(s.tabs) == 0 {
+			return nil, false
+		}
+		return s.tabs[0], true
+	}
+	for _, tab := range s.tabs {
+		if tab.ID == id {
+			return tab, true
+		}
+	}
+	return nil, false
+}
+
+func findProfile(profiles []profileFile, id string) (profileFile, bool) {
+	for _, profile := range profiles {
 		if profile.ID == id {
 			return profile, true
 		}
@@ -412,6 +649,18 @@ func filterProfilesByDirs(profiles []profileFile, dirs []string) []profileFile {
 	return filtered
 }
 
+func cloneTab(tab *browserTab) tabSummary {
+	return tabSummary{ID: tab.ID, Name: tab.Name}
+}
+
+func cloneTabs(tabs []*browserTab) []tabSummary {
+	cloned := make([]tabSummary, len(tabs))
+	for i, tab := range tabs {
+		cloned[i] = cloneTab(tab)
+	}
+	return cloned
+}
+
 func cloneStrings(values []string) []string {
 	cloned := make([]string, len(values))
 	copy(cloned, values)
@@ -424,7 +673,20 @@ func cloneProfiles(values []profileFile) []profileFile {
 	return cloned
 }
 
-func startPprof(profile profileFile) (*pprofSession, error) {
+func cloneSessionForHost(session *pprofSession, urlHost string) *pprofSession {
+	cloned := *session
+	cloned.URL = sessionURLForHost(session, urlHost)
+	return &cloned
+}
+
+func sessionURLForHost(session *pprofSession, urlHost string) string {
+	if session.Port == 0 {
+		return session.URL
+	}
+	return pprofWebURL(urlHost, session.Port)
+}
+
+func startPprof(profile profileFile, urlHost string) (*pprofSession, error) {
 	if _, err := exec.LookPath("go"); err != nil {
 		return nil, errors.New("没有找到 go 命令，请确认 Go 已安装并在 PATH 中")
 	}
@@ -433,7 +695,7 @@ func startPprof(profile profileFile) (*pprofSession, error) {
 		return nil, fmt.Errorf("分配本地端口失败：%v", err)
 	}
 
-	url := "http://127.0.0.1:" + strconv.Itoa(port)
+	url := pprofWebURL(urlHost, port)
 	ctx, cancel := context.WithCancel(context.Background())
 	args := pprofCommandArgs(port, profile.Path)
 	cmd := exec.CommandContext(ctx, "go", args...)
@@ -476,11 +738,11 @@ func startPprof(profile profileFile) (*pprofSession, error) {
 
 func pprofCommandArgs(port int, profilePath string) []string {
 	// pprof 默认会自动打开浏览器；前端已经负责 window.open，这里关闭自动打开以避免重复页面。
-	return []string{"tool", "pprof", "-http=127.0.0.1:" + strconv.Itoa(port), "-no_browser", profilePath}
+	return []string{"tool", "pprof", "-http=" + net.JoinHostPort(pprofListenHost, strconv.Itoa(port)), "-no_browser", profilePath}
 }
 
 func freePort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", net.JoinHostPort(pprofListenHost, "0"))
 	if err != nil {
 		return 0, err
 	}
@@ -490,6 +752,29 @@ func freePort() (int, error) {
 		return 0, errors.New("无法解析 TCP 端口")
 	}
 	return addr.Port, nil
+}
+
+func pprofWebURL(urlHost string, port int) string {
+	host := strings.TrimSpace(urlHost)
+	if host == "" {
+		host = pprofFallbackHost
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func publicHostFromRequest(r *http.Request) string {
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return pprofFallbackHost
+	}
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		return pprofFallbackHost
+	}
+	return host
 }
 
 func stableID(value string) string {
