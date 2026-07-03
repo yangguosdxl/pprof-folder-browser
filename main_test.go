@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,15 @@ type tabsResponse struct {
 
 type tabResponse struct {
 	Tab tabSummary `json:"tab"`
+}
+
+type dirsResponse struct {
+	Dirs []string `json:"dirs"`
+}
+
+type profilesResponse struct {
+	Profiles []profileFile `json:"profiles"`
+	Count    int           `json:"count"`
 }
 
 func Test默认会创建一个页签(t *testing.T) {
@@ -117,6 +127,112 @@ func Test可以新增页签并保存改名到服务器状态(t *testing.T) {
 	}
 	if listed.Tabs[1].Name != "线上 CPU" {
 		t.Fatalf("服务端保存的页签名 = %q，期望 %q", listed.Tabs[1].Name, "线上 CPU")
+	}
+}
+
+func Test状态文件会在重启后恢复页签目录和扫描结果(t *testing.T) {
+	storagePath := filepath.Join(t.TempDir(), "state.json")
+	profileDir := t.TempDir()
+	profilePath := filepath.Join(profileDir, "heap.pprof")
+	if err := os.WriteFile(profilePath, []byte("profile"), 0o644); err != nil {
+		t.Fatalf("创建测试 profile 文件失败：%v", err)
+	}
+
+	state, err := newAppStateWithStorage(storagePath)
+	if err != nil {
+		t.Fatalf("创建带持久化的状态失败：%v", err)
+	}
+
+	addBody, err := json.Marshal(addDirRequest{Path: profileDir})
+	if err != nil {
+		t.Fatalf("序列化添加目录请求失败：%v", err)
+	}
+	addRecorder := httptest.NewRecorder()
+	state.handleAddDir(addRecorder, httptest.NewRequest(http.MethodPost, "/api/dirs", bytes.NewReader(addBody)))
+	if addRecorder.Code != http.StatusCreated {
+		t.Fatalf("添加目录状态码 = %d，期望 %d，响应：%s", addRecorder.Code, http.StatusCreated, addRecorder.Body.String())
+	}
+
+	scanRecorder := httptest.NewRecorder()
+	state.handleScan(scanRecorder, httptest.NewRequest(http.MethodPost, "/api/scan", strings.NewReader(`{}`)))
+	if scanRecorder.Code != http.StatusOK {
+		t.Fatalf("扫描状态码 = %d，期望 %d，响应：%s", scanRecorder.Code, http.StatusOK, scanRecorder.Body.String())
+	}
+
+	createRecorder := httptest.NewRecorder()
+	state.handleCreateTab(createRecorder, httptest.NewRequest(http.MethodPost, "/api/tabs", strings.NewReader(`{}`)))
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("创建页签状态码 = %d，期望 %d，响应：%s", createRecorder.Code, http.StatusCreated, createRecorder.Body.String())
+	}
+	var created tabResponse
+	if err := json.NewDecoder(createRecorder.Body).Decode(&created); err != nil {
+		t.Fatalf("解析创建页签响应失败：%v", err)
+	}
+
+	renameBody, err := json.Marshal(renameTabRequest{ID: created.Tab.ID, Name: "重启后保留"})
+	if err != nil {
+		t.Fatalf("序列化改名请求失败：%v", err)
+	}
+	renameRecorder := httptest.NewRecorder()
+	state.handleRenameTab(renameRecorder, httptest.NewRequest(http.MethodPatch, "/api/tabs", bytes.NewReader(renameBody)))
+	if renameRecorder.Code != http.StatusOK {
+		t.Fatalf("改名状态码 = %d，期望 %d，响应：%s", renameRecorder.Code, http.StatusOK, renameRecorder.Body.String())
+	}
+
+	restored, err := newAppStateWithStorage(storagePath)
+	if err != nil {
+		t.Fatalf("读取持久化状态失败：%v", err)
+	}
+
+	listTabs := httptest.NewRecorder()
+	restored.handleListTabs(listTabs, httptest.NewRequest(http.MethodGet, "/api/tabs", nil))
+	var tabs tabsResponse
+	if err := json.NewDecoder(listTabs.Body).Decode(&tabs); err != nil {
+		t.Fatalf("解析恢复后的页签列表失败：%v", err)
+	}
+	if len(tabs.Tabs) != 2 {
+		t.Fatalf("恢复后的页签数量 = %d，期望 2", len(tabs.Tabs))
+	}
+	if tabs.Tabs[1].Name != "重启后保留" {
+		t.Fatalf("恢复后的第二个页签名 = %q，期望 %q", tabs.Tabs[1].Name, "重启后保留")
+	}
+
+	listDirs := httptest.NewRecorder()
+	restored.handleListDirs(listDirs, httptest.NewRequest(http.MethodGet, "/api/dirs", nil))
+	var dirs dirsResponse
+	if err := json.NewDecoder(listDirs.Body).Decode(&dirs); err != nil {
+		t.Fatalf("解析恢复后的目录列表失败：%v", err)
+	}
+	expectedDir, err := filepath.Abs(profileDir)
+	if err != nil {
+		t.Fatalf("计算测试目录绝对路径失败：%v", err)
+	}
+	if len(dirs.Dirs) != 1 || dirs.Dirs[0] != expectedDir {
+		t.Fatalf("恢复后的目录 = %#v，期望只包含 %q", dirs.Dirs, expectedDir)
+	}
+
+	listProfiles := httptest.NewRecorder()
+	restored.handleProfiles(listProfiles, httptest.NewRequest(http.MethodGet, "/api/profiles", nil))
+	var profiles profilesResponse
+	if err := json.NewDecoder(listProfiles.Body).Decode(&profiles); err != nil {
+		t.Fatalf("解析恢复后的 profile 列表失败：%v", err)
+	}
+	expectedProfilePath, err := filepath.Abs(profilePath)
+	if err != nil {
+		t.Fatalf("计算测试 profile 绝对路径失败：%v", err)
+	}
+	if len(profiles.Profiles) != 1 || profiles.Profiles[0].Path != expectedProfilePath {
+		t.Fatalf("恢复后的 profiles = %#v，期望只包含 %q", profiles.Profiles, expectedProfilePath)
+	}
+
+	nextTab := httptest.NewRecorder()
+	restored.handleCreateTab(nextTab, httptest.NewRequest(http.MethodPost, "/api/tabs", strings.NewReader(`{}`)))
+	var next tabResponse
+	if err := json.NewDecoder(nextTab.Body).Decode(&next); err != nil {
+		t.Fatalf("解析恢复后新建页签响应失败：%v", err)
+	}
+	if next.Tab.ID != "tab-3" {
+		t.Fatalf("恢复后新建页签 ID = %q，期望 %q", next.Tab.ID, "tab-3")
 	}
 }
 

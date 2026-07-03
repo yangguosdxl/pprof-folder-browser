@@ -113,7 +113,8 @@ node --test tests/app.test.cjs
 
 ## Notes
 
-- Application state is kept in memory. Tabs, folders, scan results, and session records are cleared when the process exits.
+- Tabs, folders, and scan results are saved under the user config directory at `pprof-folder-browser/state.json` and are restored after restart. Set `PPROF_FOLDER_BROWSER_STATE` to use a custom state file path.
+- `pprof` session records are not restored across restart because their `go tool pprof` processes exit with the app.
 - The app binds to `0.0.0.0` by default. Use `PPROF_FOLDER_BROWSER_ADDR=127.0.0.1:18080` if you only want local access.
 - Profile data can be sensitive. Do not expose the app or the started `go tool pprof -http` pages on untrusted networks.
 - If opening a profile fails because the `go` command cannot be found, verify that Go is installed and available on `PATH`.

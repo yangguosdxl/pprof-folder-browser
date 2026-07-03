@@ -32,6 +32,7 @@ type appState struct {
 	tabs          []*browserTab
 	nextTabNumber int
 	selectDir     dirSelector
+	storagePath   string
 }
 
 // dirSelector 封装系统目录选择能力，测试中会替换为不会弹窗的实现。
@@ -42,6 +43,10 @@ var errDirSelectionCanceled = errors.New("已取消选择目录")
 const (
 	defaultListenAddr  = "0.0.0.0:18080"
 	listenAddrEnv      = "PPROF_FOLDER_BROWSER_ADDR"
+	statePathEnv       = "PPROF_FOLDER_BROWSER_STATE"
+	stateDirName       = "pprof-folder-browser"
+	stateFileName      = "state.json"
+	stateVersion       = 1
 	pprofListenHost    = "0.0.0.0"
 	pprofFallbackHost  = "127.0.0.1"
 	defaultTabNameBase = "页签"
@@ -97,12 +102,25 @@ type openProfileRequest struct {
 	ID string `json:"id"`
 }
 
+type persistedAppState struct {
+	Version       int            `json:"version"`
+	NextTabNumber int            `json:"nextTabNumber"`
+	Tabs          []persistedTab `json:"tabs"`
+}
+
+type persistedTab struct {
+	ID       string        `json:"id"`
+	Name     string        `json:"name"`
+	Dirs     []string      `json:"dirs"`
+	Profiles []profileFile `json:"profiles"`
+}
+
 type apiError struct {
 	Error string `json:"error"`
 }
 
 func main() {
-	state := newAppState()
+	state := newPersistentAppState()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/tabs", state.handleListTabs)
@@ -140,6 +158,196 @@ func newAppState() *appState {
 		nextTabNumber: 2,
 		selectDir:     selectDirDialog,
 	}
+}
+
+func newPersistentAppState() *appState {
+	statePath, err := appStatePath()
+	if err != nil {
+		log.Printf("状态文件路径不可用，将仅使用内存状态：%v", err)
+		return newAppState()
+	}
+
+	state, err := newAppStateWithStorage(statePath)
+	if err != nil {
+		log.Printf("读取状态文件失败，将使用空状态：%s：%v", statePath, err)
+	}
+	return state
+}
+
+func newAppStateWithStorage(path string) (*appState, error) {
+	state := newAppState()
+	state.storagePath = strings.TrimSpace(path)
+	if state.storagePath == "" {
+		return state, nil
+	}
+
+	persisted, err := readPersistedState(state.storagePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return state, err
+	}
+
+	restored := appStateFromPersisted(persisted)
+	restored.storagePath = state.storagePath
+	return restored, nil
+}
+
+func appStatePath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv(statePathEnv)); path != "" {
+		return path, nil
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(configDir, stateDirName, stateFileName), nil
+}
+
+func readPersistedState(path string) (persistedAppState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return persistedAppState{}, err
+	}
+
+	var state persistedAppState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return persistedAppState{}, err
+	}
+	return state, nil
+}
+
+func appStateFromPersisted(persisted persistedAppState) *appState {
+	state := newAppState()
+	tabs := make([]*browserTab, 0, len(persisted.Tabs))
+	seenIDs := make(map[string]struct{}, len(persisted.Tabs))
+	maxTabNumber := 0
+
+	for _, persistedTab := range persisted.Tabs {
+		id := strings.TrimSpace(persistedTab.ID)
+		if id == "" {
+			continue
+		}
+		if _, exists := seenIDs[id]; exists {
+			continue
+		}
+		seenIDs[id] = struct{}{}
+
+		name := strings.TrimSpace(persistedTab.Name)
+		if name == "" {
+			name = id
+		}
+
+		tab := newBrowserTab(id, name)
+		tab.Dirs = cleanPersistedStrings(persistedTab.Dirs)
+		tab.Profiles = cleanPersistedProfiles(persistedTab.Profiles)
+		tabs = append(tabs, tab)
+
+		if number, ok := parseTabNumber(id); ok && number > maxTabNumber {
+			maxTabNumber = number
+		}
+	}
+
+	if len(tabs) == 0 {
+		return state
+	}
+
+	state.tabs = tabs
+	state.nextTabNumber = persisted.NextTabNumber
+	if state.nextTabNumber <= maxTabNumber {
+		state.nextTabNumber = maxTabNumber + 1
+	}
+	if state.nextTabNumber < 2 {
+		state.nextTabNumber = 2
+	}
+	return state
+}
+
+func cleanPersistedStrings(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func cleanPersistedProfiles(profiles []profileFile) []profileFile {
+	cleaned := make([]profileFile, 0, len(profiles))
+	for _, profile := range profiles {
+		profile.Path = strings.TrimSpace(profile.Path)
+		profile.Dir = strings.TrimSpace(profile.Dir)
+		if profile.Path == "" || profile.Dir == "" {
+			continue
+		}
+		profile.ID = strings.TrimSpace(profile.ID)
+		if profile.ID == "" {
+			profile.ID = stableID(profile.Path)
+		}
+		profile.Name = strings.TrimSpace(profile.Name)
+		if profile.Name == "" {
+			profile.Name = filepath.Base(profile.Path)
+		}
+		cleaned = append(cleaned, profile)
+	}
+	return cleaned
+}
+
+func parseTabNumber(id string) (int, bool) {
+	value, ok := strings.CutPrefix(id, "tab-")
+	if !ok {
+		return 0, false
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, false
+	}
+	return number, true
+}
+
+func (s *appState) saveLocked() error {
+	if s.storagePath == "" {
+		return nil
+	}
+	return writePersistedState(s.storagePath, s.persistedLocked())
+}
+
+func (s *appState) persistedLocked() persistedAppState {
+	tabs := make([]persistedTab, 0, len(s.tabs))
+	for _, tab := range s.tabs {
+		tabs = append(tabs, persistedTab{
+			ID:       tab.ID,
+			Name:     tab.Name,
+			Dirs:     cloneStrings(tab.Dirs),
+			Profiles: cloneProfiles(tab.Profiles),
+		})
+	}
+	return persistedAppState{
+		Version:       stateVersion,
+		NextTabNumber: s.nextTabNumber,
+		Tabs:          tabs,
+	}
+}
+
+func writePersistedState(path string, state persistedAppState) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func newBrowserTab(id string, name string) *browserTab {
@@ -202,6 +410,11 @@ func (s *appState) handleCreateTab(w http.ResponseWriter, r *http.Request) {
 	s.nextTabNumber++
 	s.tabs = append(s.tabs, tab)
 	responseTab := cloneTab(tab)
+	if err := s.saveLocked(); err != nil {
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"tab": responseTab})
@@ -233,6 +446,11 @@ func (s *appState) handleRenameTab(w http.ResponseWriter, r *http.Request) {
 	}
 	tab.Name = req.Name
 	responseTab := cloneTab(tab)
+	if err := s.saveLocked(); err != nil {
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{"tab": responseTab})
@@ -283,6 +501,11 @@ func (s *appState) handleAddDir(w http.ResponseWriter, r *http.Request) {
 	tab.Dirs = append(tab.Dirs, dir)
 	sort.Strings(tab.Dirs)
 	dirs := cloneStrings(tab.Dirs)
+	if err := s.saveLocked(); err != nil {
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"dirs": dirs})
@@ -316,6 +539,11 @@ func (s *appState) handleRemoveDir(w http.ResponseWriter, r *http.Request) {
 	tab.Dirs = next
 	tab.Profiles = filterProfilesByDirs(tab.Profiles, tab.Dirs)
 	dirs := cloneStrings(tab.Dirs)
+	if err := s.saveLocked(); err != nil {
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{"dirs": dirs})
@@ -375,6 +603,11 @@ func (s *appState) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tab.Profiles = profiles
+	if err := s.saveLocked(); err != nil {
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles, "count": len(profiles)})

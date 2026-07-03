@@ -113,7 +113,8 @@ node --test tests/app.test.cjs
 
 ## 注意事项
 
-- 应用状态保存在内存中，重启后页签、目录、扫描结果和会话记录都会清空。
+- 页签、目录和扫描结果会保存到用户配置目录下的 `pprof-folder-browser/state.json`，重启后会自动恢复；也可以用 `PPROF_FOLDER_BROWSER_STATE` 指定状态文件路径。
+- `pprof` 会话记录不会跨重启保留，因为对应的 `go tool pprof` 进程会在应用退出后结束。
 - 工具默认绑定 `0.0.0.0`，适合本机或可信网络使用；如果只想本机访问，请设置 `PPROF_FOLDER_BROWSER_ADDR=127.0.0.1:18080`。
 - `go tool pprof -http` 启动的 profile 页面也可能暴露性能数据，请不要在不可信网络中公开访问。
 - 如果点击“打开”时报找不到 `go` 命令，请确认 Go 已正确安装并加入 `PATH`。

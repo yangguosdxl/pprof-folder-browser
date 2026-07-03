@@ -4,6 +4,7 @@ const state = {
   views: {},
 };
 
+const activeTabStorageKey = "pprof-folder-browser.activeTabId";
 const browserDocument = typeof document === "undefined" ? null : document;
 const tabList = browserDocument?.querySelector("#tabList");
 const addTabBtn = browserDocument?.querySelector("#addTabBtn");
@@ -54,6 +55,28 @@ function currentView() {
 
 function activeTab() {
   return state.tabs.find((tab) => tab.id === state.activeTabId) || null;
+}
+
+function loadStoredActiveTabId() {
+  try {
+    if (typeof localStorage === "undefined") return "";
+    return localStorage.getItem(activeTabStorageKey) || "";
+  } catch {
+    return "";
+  }
+}
+
+function storeActiveTabId(tabId) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (tabId) {
+      localStorage.setItem(activeTabStorageKey, tabId);
+    } else {
+      localStorage.removeItem(activeTabStorageKey);
+    }
+  } catch {
+    // Some browsers disable localStorage in private or restricted contexts.
+  }
 }
 
 function log(message) {
@@ -561,13 +584,17 @@ function nextSort(currentSort, field) {
 
 async function loadTabs() {
   const data = await api("/api/tabs");
+  const storedActiveTabId = loadStoredActiveTabId();
   state.tabs = data.tabs || [];
   for (const tab of state.tabs) {
     ensureTabView(tab.id);
   }
   if (!state.tabs.some((tab) => tab.id === state.activeTabId)) {
-    state.activeTabId = data.activeTabId || state.tabs[0]?.id || "";
+    state.activeTabId = state.tabs.some((tab) => tab.id === storedActiveTabId)
+      ? storedActiveTabId
+      : data.activeTabId || state.tabs[0]?.id || "";
   }
+  storeActiveTabId(state.activeTabId);
   renderTabs();
 }
 
@@ -578,6 +605,7 @@ async function createTab() {
     if (!data.tab) return;
     state.tabs = [...state.tabs, data.tab];
     state.activeTabId = data.tab.id;
+    storeActiveTabId(state.activeTabId);
     ensureTabView(data.tab.id);
     renderAll();
     await loadActiveTabData();
@@ -613,6 +641,7 @@ async function renameActiveTab(name) {
 async function switchTab(tabId) {
   if (!tabId || tabId === state.activeTabId) return;
   state.activeTabId = tabId;
+  storeActiveTabId(state.activeTabId);
   renderAll();
   try {
     await loadActiveTabData();
