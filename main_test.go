@@ -432,6 +432,15 @@ func Test选择目录后可以继续添加目录(t *testing.T) {
 
 func Test清除所有Pprof会话会取消进程并清空列表(t *testing.T) {
 	state := newAppState()
+	originalKillProcessTree := killProcessTree
+	killed := 0
+	killProcessTree = func(cmd *exec.Cmd) error {
+		killed++
+		return nil
+	}
+	defer func() {
+		killProcessTree = originalKillProcessTree
+	}()
 	canceled := 0
 	state.tabs[0].Sessions["one"] = &pprofSession{
 		ID:     "one",
@@ -459,11 +468,37 @@ func Test清除所有Pprof会话会取消进程并清空列表(t *testing.T) {
 	if response.Cleared != 2 {
 		t.Fatalf("cleared = %d，期望 2", response.Cleared)
 	}
+	if killed != 2 {
+		t.Fatalf("结束进程树次数 = %d，期望 2", killed)
+	}
 	if canceled != 2 {
 		t.Fatalf("取消次数 = %d，期望 2", canceled)
 	}
 	if len(state.tabs[0].Sessions) != 0 {
 		t.Fatalf("剩余会话数 = %d，期望 0", len(state.tabs[0].Sessions))
+	}
+}
+
+func TestStopPprofSessionKillsProcessTreeBeforeCancel(t *testing.T) {
+	originalKillProcessTree := killProcessTree
+	calls := make([]string, 0, 2)
+	killProcessTree = func(cmd *exec.Cmd) error {
+		calls = append(calls, "kill")
+		return nil
+	}
+	defer func() {
+		killProcessTree = originalKillProcessTree
+	}()
+
+	stopPprofSession(&pprofSession{
+		Cmd: &exec.Cmd{},
+		Cancel: func() {
+			calls = append(calls, "cancel")
+		},
+	})
+
+	if got := strings.Join(calls, ","); got != "kill,cancel" {
+		t.Fatalf("调用顺序 = %s，期望 kill,cancel", got)
 	}
 }
 

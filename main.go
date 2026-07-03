@@ -672,9 +672,7 @@ func (s *appState) handleOpenProfile(w http.ResponseWriter, r *http.Request) {
 	tab, ok = s.findTabLocked(tabID)
 	if !ok {
 		s.mu.Unlock()
-		if session.Cancel != nil {
-			session.Cancel()
-		}
+		stopPprofSession(session)
 		writeError(w, http.StatusNotFound, "页签不存在")
 		return
 	}
@@ -733,13 +731,23 @@ func (s *appState) clearSessionsForTab(tabID string) (int, bool) {
 	s.mu.Unlock()
 
 	for _, session := range sessions {
-		if session.Cancel != nil {
-			session.Cancel()
-		}
+		stopPprofSession(session)
 	}
 
 	log.Printf("已清除 %d 个 pprof 进程", len(sessions))
 	return len(sessions), true
+}
+
+func stopPprofSession(session *pprofSession) {
+	if session == nil {
+		return
+	}
+	if err := killProcessTree(session.Cmd); err != nil {
+		log.Printf("结束 pprof 进程失败：%s，错误：%v", session.Path, err)
+	}
+	if session.Cancel != nil {
+		session.Cancel()
+	}
 }
 
 func (s *appState) clearSessions() int {
