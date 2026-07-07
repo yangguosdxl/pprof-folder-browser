@@ -1,1 +1,3 @@
 不使用superpowers或者gsd 技能
+
+改完后构建应用

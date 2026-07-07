@@ -126,6 +126,7 @@ func main() {
 	mux.HandleFunc("GET /api/tabs", state.handleListTabs)
 	mux.HandleFunc("POST /api/tabs", state.handleCreateTab)
 	mux.HandleFunc("PATCH /api/tabs", state.handleRenameTab)
+	mux.HandleFunc("DELETE /api/tabs", state.handleDeleteTab)
 	mux.HandleFunc("GET /api/dirs", state.handleListDirs)
 	mux.HandleFunc("POST /api/dirs", state.handleAddDir)
 	mux.HandleFunc("DELETE /api/dirs", state.handleRemoveDir)
@@ -454,6 +455,75 @@ func (s *appState) handleRenameTab(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{"tab": responseTab})
+}
+
+func (s *appState) handleDeleteTab(w http.ResponseWriter, r *http.Request) {
+	tabID := strings.TrimSpace(r.URL.Query().Get("tabId"))
+	if tabID == "" {
+		writeError(w, http.StatusBadRequest, "缺少页签 ID")
+		return
+	}
+
+	s.mu.Lock()
+	if len(s.tabs) <= 1 {
+		s.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "至少保留一个页签")
+		return
+	}
+
+	index := -1
+	for i, tab := range s.tabs {
+		if tab.ID == tabID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "页签不存在")
+		return
+	}
+
+	deletedTab := s.tabs[index]
+	sessions := make([]*pprofSession, 0, len(deletedTab.Sessions))
+	for _, session := range deletedTab.Sessions {
+		sessions = append(sessions, session)
+	}
+
+	previousTabs := s.tabs
+	nextTabs := make([]*browserTab, 0, len(s.tabs)-1)
+	nextTabs = append(nextTabs, s.tabs[:index]...)
+	nextTabs = append(nextTabs, s.tabs[index+1:]...)
+	s.tabs = nextTabs
+
+	activeTabID := ""
+	if len(s.tabs) > 0 {
+		nextIndex := index
+		if nextIndex >= len(s.tabs) {
+			nextIndex = len(s.tabs) - 1
+		}
+		activeTabID = s.tabs[nextIndex].ID
+	}
+	tabs := cloneTabs(s.tabs)
+
+	if err := s.saveLocked(); err != nil {
+		s.tabs = previousTabs
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
+		return
+	}
+	s.mu.Unlock()
+
+	for _, session := range sessions {
+		stopPprofSession(session)
+	}
+
+	log.Printf("已删除页签 %s，清除 %d 个 pprof 进程", tabID, len(sessions))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tabs":        tabs,
+		"activeTabId": activeTabID,
+		"cleared":     len(sessions),
+	})
 }
 
 func (s *appState) handleListDirs(w http.ResponseWriter, r *http.Request) {

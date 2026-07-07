@@ -130,6 +130,93 @@ func Test可以新增页签并保存改名到服务器状态(t *testing.T) {
 	}
 }
 
+func TestDeleteTabStopsItsPprofSessionsAndRemovesTab(t *testing.T) {
+	state := newAppState()
+	originalKillProcessTree := killProcessTree
+	killed := 0
+	killProcessTree = func(cmd *exec.Cmd) error {
+		killed++
+		return nil
+	}
+	defer func() {
+		killProcessTree = originalKillProcessTree
+	}()
+
+	createRecorder := httptest.NewRecorder()
+	state.handleCreateTab(createRecorder, httptest.NewRequest(http.MethodPost, "/api/tabs", strings.NewReader(`{}`)))
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("创建页签状态码 = %d，期望 %d，响应：%s", createRecorder.Code, http.StatusCreated, createRecorder.Body.String())
+	}
+	var created tabResponse
+	if err := json.NewDecoder(createRecorder.Body).Decode(&created); err != nil {
+		t.Fatalf("解析创建页签响应失败：%v", err)
+	}
+
+	tab, ok := state.findTabLocked(created.Tab.ID)
+	if !ok {
+		t.Fatalf("没有找到新建页签 %s", created.Tab.ID)
+	}
+	canceled := 0
+	tab.Sessions["one"] = &pprofSession{
+		ID:     "one",
+		Cmd:    &exec.Cmd{},
+		Cancel: func() { canceled++ },
+	}
+	tab.Sessions["two"] = &pprofSession{
+		ID:     "two",
+		Cmd:    &exec.Cmd{},
+		Cancel: func() { canceled++ },
+	}
+
+	deleteRecorder := httptest.NewRecorder()
+	state.handleDeleteTab(deleteRecorder, httptest.NewRequest(http.MethodDelete, "/api/tabs?tabId="+created.Tab.ID, nil))
+
+	if deleteRecorder.Code != http.StatusOK {
+		t.Fatalf("删除页签状态码 = %d，期望 %d，响应：%s", deleteRecorder.Code, http.StatusOK, deleteRecorder.Body.String())
+	}
+
+	var response struct {
+		Tabs        []tabSummary `json:"tabs"`
+		ActiveTabID string       `json:"activeTabId"`
+		Cleared     int          `json:"cleared"`
+	}
+	if err := json.NewDecoder(deleteRecorder.Body).Decode(&response); err != nil {
+		t.Fatalf("解析删除页签响应失败：%v", err)
+	}
+	if response.Cleared != 2 {
+		t.Fatalf("cleared = %d，期望 2", response.Cleared)
+	}
+	if killed != 2 {
+		t.Fatalf("结束进程树次数 = %d，期望 2", killed)
+	}
+	if canceled != 2 {
+		t.Fatalf("取消次数 = %d，期望 2", canceled)
+	}
+	if len(response.Tabs) != 1 || response.Tabs[0].ID == created.Tab.ID {
+		t.Fatalf("删除后的页签列表 = %#v，期望不包含 %q", response.Tabs, created.Tab.ID)
+	}
+	if response.ActiveTabID != response.Tabs[0].ID {
+		t.Fatalf("activeTabId = %q，期望 %q", response.ActiveTabID, response.Tabs[0].ID)
+	}
+	if _, ok := state.findTabLocked(created.Tab.ID); ok {
+		t.Fatalf("已删除页签 %s 仍存在", created.Tab.ID)
+	}
+}
+
+func TestDeleteLastTabIsRejected(t *testing.T) {
+	state := newAppState()
+
+	recorder := httptest.NewRecorder()
+	state.handleDeleteTab(recorder, httptest.NewRequest(http.MethodDelete, "/api/tabs?tabId=tab-1", nil))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("删除最后一个页签状态码 = %d，期望 %d，响应：%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	if len(state.tabs) != 1 {
+		t.Fatalf("页签数量 = %d，期望 1", len(state.tabs))
+	}
+}
+
 func Test状态文件会在重启后恢复页签目录和扫描结果(t *testing.T) {
 	storagePath := filepath.Join(t.TempDir(), "state.json")
 	profileDir := t.TempDir()

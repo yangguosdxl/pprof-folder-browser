@@ -1,15 +1,25 @@
 const state = {
   tabs: [],
   activeTabId: "",
+  editingTabId: "",
   views: {},
 };
 
 const activeTabStorageKey = "pprof-folder-browser.activeTabId";
+const tabsSidebarWidthStorageKey = "pprof-folder-browser.tabsSidebarWidth";
+const tabsSidebarLeftExtraStorageKey = "pprof-folder-browser.tabsSidebarLeftExtra";
+const sidebarWidthDefault = 220;
+const sidebarWidthMin = 160;
+const sidebarWidthMax = 420;
+const sidebarLeftExtraMax = 260;
 const browserDocument = typeof document === "undefined" ? null : document;
+const browserWindow = typeof window === "undefined" ? null : window;
+const shell = browserDocument?.querySelector(".shell");
+const tabsPanel = browserDocument?.querySelector(".tabs-panel");
+const sidebarResizeHandleLeft = browserDocument?.querySelector("#sidebarResizeHandleLeft");
+const sidebarResizeHandleRight = browserDocument?.querySelector("#sidebarResizeHandleRight");
 const tabList = browserDocument?.querySelector("#tabList");
 const addTabBtn = browserDocument?.querySelector("#addTabBtn");
-const tabNameForm = browserDocument?.querySelector("#tabNameForm");
-const tabNameInput = browserDocument?.querySelector("#tabNameInput");
 const dirForm = browserDocument?.querySelector("#dirForm");
 const dirInput = browserDocument?.querySelector("#dirInput");
 const chooseDirBtn = browserDocument?.querySelector("#chooseDirBtn");
@@ -79,6 +89,99 @@ function storeActiveTabId(tabId) {
   }
 }
 
+function clampSidebarWidth(width, containerWidth = 0) {
+  const numericWidth = Number(width);
+  const requestedWidth = Number.isFinite(numericWidth) ? numericWidth : sidebarWidthDefault;
+  const containerMax = containerWidth > 0 ? Math.max(sidebarWidthMin, containerWidth - 360) : sidebarWidthMax;
+  const maxWidth = Math.min(sidebarWidthMax, containerMax);
+  return Math.round(Math.min(Math.max(requestedWidth, sidebarWidthMin), maxWidth));
+}
+
+function clampSidebarLeftExtra(extra, availableLeft = sidebarLeftExtraMax) {
+  const numericExtra = Number(extra);
+  const requestedExtra = Number.isFinite(numericExtra) ? numericExtra : 0;
+  const maxExtra = Math.min(sidebarLeftExtraMax, Math.max(0, availableLeft));
+  return Math.round(Math.min(Math.max(requestedExtra, 0), maxExtra));
+}
+
+function loadStoredSidebarWidth() {
+  try {
+    if (typeof localStorage === "undefined") return 0;
+    return Number.parseInt(localStorage.getItem(tabsSidebarWidthStorageKey) || "", 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function loadStoredSidebarLeftExtra() {
+  try {
+    if (typeof localStorage === "undefined") return 0;
+    return Number.parseInt(localStorage.getItem(tabsSidebarLeftExtraStorageKey) || "", 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function storeSidebarWidth(width) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(tabsSidebarWidthStorageKey, String(Math.round(width)));
+  } catch {
+    // Some browsers disable localStorage in private or restricted contexts.
+  }
+}
+
+function storeSidebarLeftExtra(extra) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(tabsSidebarLeftExtraStorageKey, String(Math.round(extra)));
+  } catch {
+    // Some browsers disable localStorage in private or restricted contexts.
+  }
+}
+
+function currentSidebarWidth() {
+  if (!tabsPanel) return sidebarWidthDefault;
+  const styledWidth = Number.parseInt(shell?.style.getPropertyValue("--tabs-sidebar-width") || "", 10);
+  if (styledWidth > 0) return styledWidth;
+  const width = tabsPanel.getBoundingClientRect().width - currentSidebarLeftExtra();
+  return width > 0 ? width : sidebarWidthDefault;
+}
+
+function currentSidebarLeftExtra() {
+  if (!shell) return 0;
+  return Number.parseInt(shell.style.getPropertyValue("--tabs-sidebar-left-extra") || "", 10) || 0;
+}
+
+function availableSidebarLeftExtra() {
+  if (!shell) return sidebarLeftExtraMax;
+  return Math.max(0, shell.getBoundingClientRect().left - 8);
+}
+
+function applySidebarWidth(width) {
+  if (!shell) return clampSidebarWidth(width);
+
+  const clamped = clampSidebarWidth(width, shell.clientWidth);
+  shell.style.setProperty("--tabs-sidebar-width", `${clamped}px`);
+  if (sidebarResizeHandleRight) {
+    sidebarResizeHandleRight.setAttribute("aria-valuenow", String(clamped));
+  }
+  return clamped;
+}
+
+function applySidebarLeftExtra(extra) {
+  if (!shell) return clampSidebarLeftExtra(extra);
+
+  const availableLeft = availableSidebarLeftExtra();
+  const clamped = clampSidebarLeftExtra(extra, availableLeft);
+  shell.style.setProperty("--tabs-sidebar-left-extra", `${clamped}px`);
+  if (sidebarResizeHandleLeft) {
+    sidebarResizeHandleLeft.setAttribute("aria-valuemax", String(clampSidebarLeftExtra(sidebarLeftExtraMax, availableLeft)));
+    sidebarResizeHandleLeft.setAttribute("aria-valuenow", String(clamped));
+  }
+  return clamped;
+}
+
 function log(message) {
   if (!logBox) return;
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -111,33 +214,65 @@ function renderTabs() {
   tabList.innerHTML = state.tabs
     .map((tab) => {
       const active = tab.id === state.activeTabId;
+      const editing = tab.id === state.editingTabId;
+      const canDelete = state.tabs.length > 1;
+      const tabClasses = ["tab-item"];
+      if (active) tabClasses.push("active");
+      if (editing) tabClasses.push("editing");
       return `
-        <button
-          class="tab-button${active ? " active" : ""}"
-          type="button"
-          role="tab"
-          aria-selected="${active ? "true" : "false"}"
-          data-tab-id="${escapeHtml(tab.id)}"
-          title="${escapeHtml(tab.name)}"
-        >${escapeHtml(tab.name)}</button>
+        <div class="${tabClasses.join(" ")}">
+          ${
+            editing
+              ? `
+                <form class="tab-edit-form" data-edit-tab-id="${escapeHtml(tab.id)}">
+                  <input
+                    class="tab-edit-input"
+                    type="text"
+                    value="${escapeHtml(tab.name)}"
+                    aria-label="编辑页签名称"
+                    autocomplete="off"
+                  />
+                </form>
+              `
+              : `
+                <button
+                  class="tab-button${active ? " active" : ""}"
+                  type="button"
+                  role="tab"
+                  aria-selected="${active ? "true" : "false"}"
+                  data-tab-id="${escapeHtml(tab.id)}"
+                  title="${escapeHtml(tab.name)}"
+                >${escapeHtml(tab.name)}</button>
+                <div class="tab-action-buttons">
+                  <button
+                    class="tab-action-button tab-edit-button"
+                    type="button"
+                    data-edit-tab-button-id="${escapeHtml(tab.id)}"
+                    aria-label="修改页签 ${escapeHtml(tab.name)}"
+                    title="修改页签名称"
+                  >&#9998;</button>
+                  ${
+                    canDelete
+                      ? `
+                        <button
+                          class="tab-action-button tab-close-button"
+                          type="button"
+                          data-delete-tab-id="${escapeHtml(tab.id)}"
+                          aria-label="删除页签 ${escapeHtml(tab.name)}"
+                          title="删除页签"
+                        >×</button>
+                      `
+                      : ""
+                  }
+                </div>
+              `
+          }
+        </div>
       `;
     })
     .join("");
 
-  syncActiveTabForm();
-}
-
-function syncActiveTabForm() {
-  if (!tabNameInput) return;
-  const tab = activeTab();
-  tabNameInput.value = tab ? tab.name : "";
-  tabNameInput.disabled = !tab;
-  if (tabNameForm) {
-    const button = tabNameForm.querySelector("button");
-    if (button) {
-      button.disabled = !tab;
-    }
-  }
+  focusEditingTabInput();
 }
 
 function renderDirs() {
@@ -330,7 +465,14 @@ function renderProfileDetail() {
       <dt>目录</dt>
       <dd title="${escapeHtml(profile.dir)}">${escapeHtml(profile.dir)}</dd>
       <dt>路径</dt>
-      <dd title="${escapeHtml(profile.path)}">${escapeHtml(profile.path)}</dd>
+      <dd title="${escapeHtml(profile.path)}">
+        <button
+          class="copy-path-button"
+          type="button"
+          data-copy-path="${escapeHtml(profile.path)}"
+          title="点击复制"
+        >${escapeHtml(profile.path)}</button>
+      </dd>
     </dl>
     <button class="open-btn detail-open-btn" type="button" data-open-id="${escapeHtml(profile.id)}">打开</button>
   `;
@@ -586,6 +728,9 @@ async function loadTabs() {
   const data = await api("/api/tabs");
   const storedActiveTabId = loadStoredActiveTabId();
   state.tabs = data.tabs || [];
+  if (!state.tabs.some((tab) => tab.id === state.editingTabId)) {
+    state.editingTabId = "";
+  }
   for (const tab of state.tabs) {
     ensureTabView(tab.id);
   }
@@ -603,6 +748,7 @@ async function createTab() {
   try {
     const data = await api("/api/tabs", { method: "POST", body: "{}" });
     if (!data.tab) return;
+    state.editingTabId = "";
     state.tabs = [...state.tabs, data.tab];
     state.activeTabId = data.tab.id;
     storeActiveTabId(state.activeTabId);
@@ -618,28 +764,183 @@ async function createTab() {
   }
 }
 
-async function renameActiveTab(name) {
+async function renameTab(tabId, name) {
   const trimmed = name.trim();
-  if (!trimmed || !state.activeTabId) return;
+  if (!trimmed || !tabId) return null;
 
   try {
     const data = await api("/api/tabs", {
       method: "PATCH",
-      body: JSON.stringify({ id: state.activeTabId, name: trimmed }),
+      body: JSON.stringify({ id: tabId, name: trimmed }),
     });
-    if (!data.tab) return;
+    if (!data.tab) return null;
     state.tabs = state.tabs.map((tab) => (tab.id === data.tab.id ? data.tab : tab));
-    renderTabs();
-    log(`已保存页签名称：${data.tab.name}`);
+    return data.tab;
   } catch (error) {
     log(error.message);
     alert(error.message);
-    syncActiveTabForm();
+    return null;
+  }
+}
+
+function startEditTab(tabId) {
+  if (!state.tabs.some((tab) => tab.id === tabId)) return;
+  state.editingTabId = tabId;
+  renderTabs();
+}
+
+function cancelEditTab() {
+  if (!state.editingTabId) return;
+  state.editingTabId = "";
+  renderTabs();
+}
+
+async function finishEditTab(tabId, name) {
+  const tab = state.tabs.find((item) => item.id === tabId);
+  if (!tab) return;
+
+  const trimmed = name.trim();
+  if (!trimmed || trimmed === tab.name) {
+    state.editingTabId = "";
+    renderTabs();
+    return;
+  }
+
+  const renamed = await renameTab(tabId, trimmed);
+  if (!renamed) {
+    focusEditingTabInput();
+    return;
+  }
+  state.editingTabId = "";
+  renderTabs();
+  log(`已保存页签名称：${renamed.name}`);
+}
+
+function focusEditingTabInput() {
+  if (!state.editingTabId || !browserDocument) return;
+  const focusInput = () => {
+    const form = Array.from(browserDocument.querySelectorAll("[data-edit-tab-id]")).find(
+      (item) => item.dataset.editTabId === state.editingTabId,
+    );
+    const input = form?.querySelector(".tab-edit-input");
+    if (!input) return;
+    input.focus();
+    input.select();
+  };
+
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(focusInput);
+    return;
+  }
+  setTimeout(focusInput, 0);
+}
+
+function nextTabIdAfterDelete(tabs, activeTabId, deletedTabId) {
+  if (activeTabId !== deletedTabId) return activeTabId;
+  const index = tabs.findIndex((tab) => tab.id === deletedTabId);
+  if (index < 0) return activeTabId;
+  return tabs[index + 1]?.id || tabs[index - 1]?.id || "";
+}
+
+function fallbackTabIdAfterDelete(tabId) {
+  return nextTabIdAfterDelete(state.tabs, state.activeTabId, tabId);
+}
+
+async function deleteTab(tabId) {
+  if (!tabId || state.tabs.length <= 1) return;
+  const tab = state.tabs.find((item) => item.id === tabId);
+  if (!tab) return;
+
+  const confirmed = window.confirm(`删除页签「${tab.name}」？该页签已打开的 pprof 进程会全部结束。`);
+  if (!confirmed) return;
+
+  const fallbackTabId = tabId === state.activeTabId ? fallbackTabIdAfterDelete(tabId) : state.activeTabId;
+  try {
+    const data = await api(pathWithTab("/api/tabs", tabId), { method: "DELETE" });
+    state.tabs = data.tabs || state.tabs.filter((item) => item.id !== tabId);
+    delete state.views[tabId];
+    if (state.editingTabId === tabId) {
+      state.editingTabId = "";
+    }
+
+    if (!state.tabs.some((item) => item.id === state.activeTabId)) {
+      state.activeTabId = state.tabs.some((item) => item.id === fallbackTabId)
+        ? fallbackTabId
+        : data.activeTabId || state.tabs[0]?.id || "";
+    }
+    storeActiveTabId(state.activeTabId);
+    renderAll();
+    await loadActiveTabData();
+    log(`已删除页签：${tab.name}，结束 ${data.cleared || 0} 个 pprof 进程`);
+  } catch (error) {
+    log(error.message);
+    alert(error.message);
+  }
+}
+
+async function copyPathToClipboard(path) {
+  if (!path) return;
+  try {
+    await writeClipboardText(path);
+    showCopyPathSuccess();
+  } catch (error) {
+    log(`复制路径失败：${error.message}`);
+    alert(`复制路径失败：${error.message}`);
+  }
+}
+
+function showCopyPathSuccess() {
+  const message = "已复制路径到剪切板";
+  log(message);
+  if (!browserDocument) return;
+
+  const status = browserDocument.createElement("div");
+  status.className = "toast";
+  status.textContent = message;
+  browserDocument.body.appendChild(status);
+  setTimeout(() => status.remove(), 1600);
+}
+
+async function writeClipboardText(text) {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      fallbackCopyText(text);
+      return;
+    }
+  }
+  fallbackCopyText(text);
+}
+
+function fallbackCopyText(text) {
+  if (!browserDocument?.body) {
+    throw new Error("当前环境不支持剪切板");
+  }
+
+  const textarea = browserDocument.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  browserDocument.body.appendChild(textarea);
+  textarea.select();
+  if (typeof browserDocument.execCommand !== "function") {
+    textarea.remove();
+    throw new Error("当前环境不支持剪切板");
+  }
+  const copied = browserDocument.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("浏览器拒绝复制");
   }
 }
 
 async function switchTab(tabId) {
   if (!tabId || tabId === state.activeTabId) return;
+  state.editingTabId = "";
   state.activeTabId = tabId;
   storeActiveTabId(state.activeTabId);
   renderAll();
@@ -793,18 +1094,41 @@ async function removeDir(path) {
 }
 
 function boot() {
+  initSidebarResize();
+
   tabList.addEventListener("click", (event) => {
+    const deleteButton = event.target.closest("[data-delete-tab-id]");
+    if (deleteButton) {
+      deleteTab(deleteButton.dataset.deleteTabId);
+      return;
+    }
+
+    const editButton = event.target.closest("[data-edit-tab-button-id]");
+    if (editButton) {
+      startEditTab(editButton.dataset.editTabButtonId);
+      return;
+    }
+
     const button = event.target.closest("[data-tab-id]");
     if (!button) return;
     switchTab(button.dataset.tabId);
   });
 
-  addTabBtn.addEventListener("click", createTab);
-
-  tabNameForm.addEventListener("submit", async (event) => {
+  tabList.addEventListener("submit", async (event) => {
+    const form = event.target.closest("[data-edit-tab-id]");
+    if (!form) return;
     event.preventDefault();
-    await renameActiveTab(tabNameInput.value);
+    const input = form.querySelector(".tab-edit-input");
+    await finishEditTab(form.dataset.editTabId, input?.value || "");
   });
+
+  tabList.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    if (!event.target.closest("[data-edit-tab-id]")) return;
+    cancelEditTab();
+  });
+
+  addTabBtn.addEventListener("click", createTab);
 
   dirForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -837,6 +1161,12 @@ function boot() {
   });
 
   profileDetail.addEventListener("click", (event) => {
+    const copyButton = event.target.closest("[data-copy-path]");
+    if (copyButton) {
+      copyPathToClipboard(copyButton.dataset.copyPath);
+      return;
+    }
+
     const button = event.target.closest("[data-open-id]");
     if (!button) return;
     openProfile(button.dataset.openId);
@@ -857,6 +1187,106 @@ function boot() {
     .catch((error) => log(error.message));
   renderProfiles();
   renderSessions();
+}
+
+function initSidebarResize() {
+  if (!shell || !tabsPanel) return;
+
+  let latestWidth = applySidebarWidth(loadStoredSidebarWidth() || currentSidebarWidth());
+  let latestLeftExtra = applySidebarLeftExtra(loadStoredSidebarLeftExtra());
+
+  if (sidebarResizeHandleRight) {
+    sidebarResizeHandleRight.setAttribute("aria-valuemin", String(sidebarWidthMin));
+    sidebarResizeHandleRight.setAttribute("aria-valuemax", String(sidebarWidthMax));
+    let draggingRight = false;
+    let startX = 0;
+    let startWidth = latestWidth;
+
+    sidebarResizeHandleRight.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      draggingRight = true;
+      startX = event.clientX;
+      startWidth = currentSidebarWidth();
+      latestWidth = startWidth;
+      browserDocument.body.classList.add("resizing-sidebar");
+      sidebarResizeHandleRight.setPointerCapture?.(event.pointerId);
+    });
+
+    sidebarResizeHandleRight.addEventListener("pointermove", (event) => {
+      if (!draggingRight) return;
+      latestWidth = applySidebarWidth(startWidth + event.clientX - startX);
+    });
+
+    const finishRightDrag = (event) => {
+      if (!draggingRight) return;
+      draggingRight = false;
+      browserDocument.body.classList.remove("resizing-sidebar");
+      sidebarResizeHandleRight.releasePointerCapture?.(event.pointerId);
+      latestWidth = applySidebarWidth(latestWidth);
+      storeSidebarWidth(latestWidth);
+    };
+
+    sidebarResizeHandleRight.addEventListener("pointerup", finishRightDrag);
+    sidebarResizeHandleRight.addEventListener("pointercancel", finishRightDrag);
+    sidebarResizeHandleRight.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const delta = event.shiftKey ? 30 : 10;
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      latestWidth = applySidebarWidth(currentSidebarWidth() + direction * delta);
+      storeSidebarWidth(latestWidth);
+    });
+  }
+
+  if (sidebarResizeHandleLeft) {
+    sidebarResizeHandleLeft.setAttribute("aria-valuemin", "0");
+    sidebarResizeHandleLeft.setAttribute("aria-valuemax", String(sidebarLeftExtraMax));
+    let draggingLeft = false;
+    let startX = 0;
+    let startLeftExtra = latestLeftExtra;
+
+    sidebarResizeHandleLeft.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      draggingLeft = true;
+      startX = event.clientX;
+      startLeftExtra = currentSidebarLeftExtra();
+      latestLeftExtra = startLeftExtra;
+      browserDocument.body.classList.add("resizing-sidebar");
+      sidebarResizeHandleLeft.setPointerCapture?.(event.pointerId);
+    });
+
+    sidebarResizeHandleLeft.addEventListener("pointermove", (event) => {
+      if (!draggingLeft) return;
+      latestLeftExtra = applySidebarLeftExtra(startLeftExtra + startX - event.clientX);
+    });
+
+    const finishLeftDrag = (event) => {
+      if (!draggingLeft) return;
+      draggingLeft = false;
+      browserDocument.body.classList.remove("resizing-sidebar");
+      sidebarResizeHandleLeft.releasePointerCapture?.(event.pointerId);
+      latestLeftExtra = applySidebarLeftExtra(latestLeftExtra);
+      storeSidebarLeftExtra(latestLeftExtra);
+    };
+
+    sidebarResizeHandleLeft.addEventListener("pointerup", finishLeftDrag);
+    sidebarResizeHandleLeft.addEventListener("pointercancel", finishLeftDrag);
+    sidebarResizeHandleLeft.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const delta = event.shiftKey ? 30 : 10;
+      const direction = event.key === "ArrowLeft" ? 1 : -1;
+      latestLeftExtra = applySidebarLeftExtra(currentSidebarLeftExtra() + direction * delta);
+      storeSidebarLeftExtra(latestLeftExtra);
+    });
+  }
+
+  browserWindow?.addEventListener("resize", () => {
+    latestWidth = applySidebarWidth(loadStoredSidebarWidth() || currentSidebarWidth());
+    latestLeftExtra = applySidebarLeftExtra(loadStoredSidebarLeftExtra());
+  });
 }
 
 function formatSize(bytes) {
@@ -891,6 +1321,9 @@ if (browserDocument) {
 if (typeof module !== "undefined") {
   module.exports = {
     buildProfileTree,
+    clampSidebarLeftExtra,
+    clampSidebarWidth,
+    nextTabIdAfterDelete,
     nextSort,
     pathWithTab,
     profileMatchesFilter,
