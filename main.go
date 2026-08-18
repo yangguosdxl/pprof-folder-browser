@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"embed"
@@ -24,11 +25,12 @@ import (
 	"time"
 )
 
-//go:embed web/*
+//go:embed web
 var webFiles embed.FS
 
 type appState struct {
 	mu            sync.Mutex
+	compareMu     sync.Mutex
 	tabs          []*browserTab
 	nextTabNumber int
 	selectDir     dirSelector
@@ -50,19 +52,22 @@ const (
 	pprofListenHost    = "0.0.0.0"
 	pprofFallbackHost  = "127.0.0.1"
 	defaultTabNameBase = "页签"
+	diffResultDirName  = "diff-result"
 )
 
 type browserTab struct {
-	ID       string                   `json:"id"`
-	Name     string                   `json:"name"`
-	Dirs     []string                 `json:"-"`
-	Profiles []profileFile            `json:"-"`
-	Sessions map[string]*pprofSession `json:"-"`
+	ID        string                   `json:"id"`
+	Name      string                   `json:"name"`
+	CreatedAt time.Time                `json:"createdAt"`
+	Dirs      []string                 `json:"-"`
+	Profiles  []profileFile            `json:"-"`
+	Sessions  map[string]*pprofSession `json:"-"`
 }
 
 type tabSummary struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 type profileFile struct {
@@ -102,6 +107,26 @@ type openProfileRequest struct {
 	ID string `json:"id"`
 }
 
+type compareProfilesRequest struct {
+	FirstTabID  string `json:"firstTabId"`
+	SecondTabID string `json:"secondTabId"`
+}
+
+type compareProfilesResponse struct {
+	OutputDir string        `json:"outputDir"`
+	Compared  int           `json:"compared"`
+	Files     []string      `json:"files"`
+	Warnings  []string      `json:"warnings"`
+	Tab       tabSummary    `json:"tab"`
+	Profiles  []profileFile `json:"profiles"`
+}
+
+type profileComparison struct {
+	First      profileFile
+	Second     profileFile
+	OutputName string
+}
+
 type persistedAppState struct {
 	Version       int            `json:"version"`
 	NextTabNumber int            `json:"nextTabNumber"`
@@ -109,15 +134,21 @@ type persistedAppState struct {
 }
 
 type persistedTab struct {
-	ID       string        `json:"id"`
-	Name     string        `json:"name"`
-	Dirs     []string      `json:"dirs"`
-	Profiles []profileFile `json:"profiles"`
+	ID        string        `json:"id"`
+	Name      string        `json:"name"`
+	CreatedAt time.Time     `json:"createdAt,omitempty"`
+	Dirs      []string      `json:"dirs"`
+	Profiles  []profileFile `json:"profiles"`
 }
 
 type apiError struct {
 	Error string `json:"error"`
 }
+
+var (
+	errNoMatchingProfiles = errors.New("两个页签中没有可比较的同名 pprof 文件，请先扫描并处理重复文件")
+	runPprofDiff          = defaultRunPprofDiff
+)
 
 func main() {
 	state := newPersistentAppState()
@@ -133,6 +164,7 @@ func main() {
 	mux.HandleFunc("POST /api/select-dir", state.handleSelectDir)
 	mux.HandleFunc("POST /api/scan", state.handleScan)
 	mux.HandleFunc("GET /api/profiles", state.handleProfiles)
+	mux.HandleFunc("POST /api/compare", state.handleCompareProfiles)
 	mux.HandleFunc("POST /api/open", state.handleOpenProfile)
 	mux.HandleFunc("GET /api/sessions", state.handleSessions)
 	mux.HandleFunc("DELETE /api/sessions", state.handleClearSessions)
@@ -225,7 +257,9 @@ func appStateFromPersisted(persisted persistedAppState) *appState {
 	seenIDs := make(map[string]struct{}, len(persisted.Tabs))
 	maxTabNumber := 0
 
-	for _, persistedTab := range persisted.Tabs {
+	// 旧版本没有加入时间，按原有文件顺序补齐递增时间，保持兼容且顺序稳定。
+	legacyBase := time.Now().Add(-time.Duration(len(persisted.Tabs)) * time.Nanosecond)
+	for index, persistedTab := range persisted.Tabs {
 		id := strings.TrimSpace(persistedTab.ID)
 		if id == "" {
 			continue
@@ -241,6 +275,10 @@ func appStateFromPersisted(persisted persistedAppState) *appState {
 		}
 
 		tab := newBrowserTab(id, name)
+		tab.CreatedAt = persistedTab.CreatedAt
+		if tab.CreatedAt.IsZero() {
+			tab.CreatedAt = legacyBase.Add(time.Duration(index) * time.Nanosecond)
+		}
 		tab.Dirs = cleanPersistedStrings(persistedTab.Dirs)
 		tab.Profiles = cleanPersistedProfiles(persistedTab.Profiles)
 		tabs = append(tabs, tab)
@@ -327,10 +365,11 @@ func (s *appState) persistedLocked() persistedAppState {
 	tabs := make([]persistedTab, 0, len(s.tabs))
 	for _, tab := range s.tabs {
 		tabs = append(tabs, persistedTab{
-			ID:       tab.ID,
-			Name:     tab.Name,
-			Dirs:     cloneStrings(tab.Dirs),
-			Profiles: cloneProfiles(tab.Profiles),
+			ID:        tab.ID,
+			Name:      tab.Name,
+			CreatedAt: tab.CreatedAt,
+			Dirs:      cloneStrings(tab.Dirs),
+			Profiles:  cloneProfiles(tab.Profiles),
 		})
 	}
 	return persistedAppState{
@@ -353,11 +392,12 @@ func writePersistedState(path string, state persistedAppState) error {
 
 func newBrowserTab(id string, name string) *browserTab {
 	return &browserTab{
-		ID:       id,
-		Name:     name,
-		Dirs:     []string{},
-		Profiles: []profileFile{},
-		Sessions: make(map[string]*pprofSession),
+		ID:        id,
+		Name:      name,
+		CreatedAt: time.Now(),
+		Dirs:      []string{},
+		Profiles:  []profileFile{},
+		Sessions:  make(map[string]*pprofSession),
 	}
 }
 
@@ -381,7 +421,7 @@ func (s *appState) handleListTabs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	activeTabID := ""
 	if len(s.tabs) > 0 {
-		activeTabID = s.tabs[0].ID
+		activeTabID = newestTab(s.tabs).ID
 	}
 	tabs := cloneTabs(s.tabs)
 	s.mu.Unlock()
@@ -697,6 +737,92 @@ func (s *appState) handleProfiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles})
 }
 
+func (s *appState) handleCompareProfiles(w http.ResponseWriter, r *http.Request) {
+	var req compareProfilesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	req.FirstTabID = strings.TrimSpace(req.FirstTabID)
+	req.SecondTabID = strings.TrimSpace(req.SecondTabID)
+	if req.FirstTabID == "" || req.SecondTabID == "" {
+		writeError(w, http.StatusBadRequest, "请选择两个页签进行比较")
+		return
+	}
+	if req.FirstTabID == req.SecondTabID {
+		writeError(w, http.StatusBadRequest, "不能与同一个页签比较")
+		return
+	}
+
+	// Keep output replacement and result-tab creation ordered when requests overlap.
+	s.compareMu.Lock()
+	defer s.compareMu.Unlock()
+
+	s.mu.Lock()
+	firstTab, firstOK := s.findTabLocked(req.FirstTabID)
+	secondTab, secondOK := s.findTabLocked(req.SecondTabID)
+	if !firstOK || !secondOK {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "要比较的页签不存在")
+		return
+	}
+	firstName := firstTab.Name
+	firstProfiles := cloneProfiles(firstTab.Profiles)
+	secondName := secondTab.Name
+	secondProfiles := cloneProfiles(secondTab.Profiles)
+	s.mu.Unlock()
+
+	result, err := compareTabProfiles(r.Context(), firstName, firstProfiles, secondName, secondProfiles)
+	for _, warning := range result.Warnings {
+		log.Printf("pprof 差分警告：%s", warning)
+	}
+	if err != nil {
+		if errors.Is(err, errNoMatchingProfiles) {
+			message := err.Error()
+			if len(result.Warnings) > 0 {
+				message += "；" + strings.Join(result.Warnings, "；")
+			}
+			writeError(w, http.StatusBadRequest, message)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	profiles, err := scanProfiles([]string{result.OutputDir})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("扫描差分结果失败：%v", err))
+		return
+	}
+	resultTab, err := s.createResultTab(comparisonFolderName(firstName, secondName), result.OutputDir, profiles)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("创建差分结果页签失败：%v", err))
+		return
+	}
+	result.Tab = resultTab
+	result.Profiles = profiles
+
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *appState) createResultTab(name string, outputDir string, profiles []profileFile) (tabSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tabNumber := s.nextTabNumber
+	tab := newBrowserTab(fmt.Sprintf("tab-%d", tabNumber), name)
+	tab.Dirs = []string{outputDir}
+	tab.Profiles = cloneProfiles(profiles)
+	s.nextTabNumber++
+	s.tabs = append(s.tabs, tab)
+	if err := s.saveLocked(); err != nil {
+		s.tabs = s.tabs[:len(s.tabs)-1]
+		s.nextTabNumber = tabNumber
+		return tabSummary{}, err
+	}
+	return cloneTab(tab), nil
+}
+
 func (s *appState) handleOpenProfile(w http.ResponseWriter, r *http.Request) {
 	var req openProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -778,6 +904,11 @@ func (s *appState) handleSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *appState) handleClearSessions(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(r.URL.Query().Get("tabId")) == "" {
+		cleared := s.clearSessions()
+		writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
+		return
+	}
 	cleared, ok := s.clearSessionsForTab(r.URL.Query().Get("tabId"))
 	if !ok {
 		writeError(w, http.StatusNotFound, "页签不存在")
@@ -864,6 +995,228 @@ func findProfile(profiles []profileFile, id string) (profileFile, bool) {
 		}
 	}
 	return profileFile{}, false
+}
+
+func compareTabProfiles(ctx context.Context, firstTabName string, firstProfiles []profileFile, secondTabName string, secondProfiles []profileFile) (compareProfilesResponse, error) {
+	comparisons, warnings := matchingProfileComparisons(firstTabName, firstProfiles, secondTabName, secondProfiles)
+	result := compareProfilesResponse{Warnings: warnings}
+	if len(comparisons) == 0 {
+		return result, errNoMatchingProfiles
+	}
+
+	outputDir, err := comparisonOutputDir(firstTabName, secondTabName)
+	if err != nil {
+		return result, fmt.Errorf("确定差分结果目录失败：%w", err)
+	}
+	parentDir := filepath.Dir(outputDir)
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		return result, fmt.Errorf("创建差分结果父目录失败：%w", err)
+	}
+	temporaryDir, err := os.MkdirTemp(parentDir, ".pprof-diff-")
+	if err != nil {
+		return result, fmt.Errorf("创建差分临时目录失败：%w", err)
+	}
+	defer func() {
+		if temporaryDir != "" {
+			_ = os.RemoveAll(temporaryDir)
+		}
+	}()
+
+	result.OutputDir = outputDir
+	result.Files = make([]string, 0, len(comparisons))
+	for _, comparison := range comparisons {
+		outputPath := filepath.Join(temporaryDir, comparison.OutputName)
+		if err := runPprofDiff(ctx, comparison.First.Path, comparison.Second.Path, outputPath); err != nil {
+			return result, fmt.Errorf("比较 %q 失败：%w", comparison.OutputName, err)
+		}
+		result.Files = append(result.Files, filepath.Join(outputDir, comparison.OutputName))
+	}
+
+	if err := replaceOutputDirectory(temporaryDir, outputDir); err != nil {
+		return result, fmt.Errorf("替换差分结果目录失败：%w", err)
+	}
+	temporaryDir = ""
+	result.Compared = len(comparisons)
+	return result, nil
+}
+
+func matchingProfileComparisons(firstTabName string, firstProfiles []profileFile, secondTabName string, secondProfiles []profileFile) ([]profileComparison, []string) {
+	firstByName := profilesByName(firstProfiles)
+	secondByName := profilesByName(secondProfiles)
+	keys := make(map[string]struct{}, len(firstByName)+len(secondByName))
+	for key := range firstByName {
+		keys[key] = struct{}{}
+	}
+	for key := range secondByName {
+		keys[key] = struct{}{}
+	}
+
+	names := make([]string, 0, len(keys))
+	for name := range keys {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	comparisons := make([]profileComparison, 0)
+	warnings := make([]string, 0)
+	usedOutputNames := make(map[string]struct{})
+	for _, name := range names {
+		firstMatches := firstByName[name]
+		secondMatches := secondByName[name]
+		displayName := comparisonDisplayName(firstMatches, secondMatches)
+		if len(firstMatches) > 1 {
+			warnings = append(warnings, fmt.Sprintf("文件 %q 在页签 %q 中有 %d 份，已跳过", displayName, firstTabName, len(firstMatches)))
+		}
+		if len(secondMatches) > 1 {
+			warnings = append(warnings, fmt.Sprintf("文件 %q 在页签 %q 中有 %d 份，已跳过", displayName, secondTabName, len(secondMatches)))
+		}
+		if len(firstMatches) != 1 || len(secondMatches) != 1 {
+			continue
+		}
+
+		outputName := uniqueComparisonOutputName(safePathComponent(firstMatches[0].Name), usedOutputNames)
+		comparisons = append(comparisons, profileComparison{
+			First:      firstMatches[0],
+			Second:     secondMatches[0],
+			OutputName: outputName,
+		})
+	}
+	return comparisons, warnings
+}
+
+func profilesByName(profiles []profileFile) map[string][]profileFile {
+	byName := make(map[string][]profileFile)
+	for _, profile := range profiles {
+		name := strings.TrimSpace(profile.Name)
+		if name == "" {
+			name = filepath.Base(profile.Path)
+		}
+		if name == "" || name == "." {
+			continue
+		}
+		key := strings.ToLower(name)
+		byName[key] = append(byName[key], profile)
+	}
+	return byName
+}
+
+func comparisonDisplayName(firstMatches []profileFile, secondMatches []profileFile) string {
+	if len(firstMatches) > 0 {
+		return firstMatches[0].Name
+	}
+	if len(secondMatches) > 0 {
+		return secondMatches[0].Name
+	}
+	return "pprof"
+}
+
+func comparisonOutputDir(firstTabName string, secondTabName string) (string, error) {
+	root, err := filepath.Abs(diffResultDirName)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, comparisonFolderName(firstTabName, secondTabName)), nil
+}
+
+func comparisonFolderName(firstTabName string, secondTabName string) string {
+	return safePathComponent(firstTabName) + " vs " + safePathComponent(secondTabName)
+}
+
+func safePathComponent(value string) string {
+	const invalidPathCharacters = `<>:"/\\|?*`
+
+	var builder strings.Builder
+	for _, char := range strings.TrimSpace(value) {
+		if char < 32 || strings.ContainsRune(invalidPathCharacters, char) {
+			builder.WriteByte('_')
+			continue
+		}
+		builder.WriteRune(char)
+	}
+	cleaned := strings.Trim(builder.String(), ". ")
+	if cleaned == "" {
+		cleaned = "unnamed"
+	}
+	if isWindowsReservedName(cleaned) {
+		cleaned += "_"
+	}
+
+	const maxComponentRunes = 100
+	runes := []rune(cleaned)
+	if len(runes) > maxComponentRunes {
+		cleaned = string(runes[:maxComponentRunes])
+	}
+	return cleaned
+}
+
+func isWindowsReservedName(value string) bool {
+	name := strings.ToUpper(strings.TrimSuffix(value, filepath.Ext(value)))
+	switch name {
+	case "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
+}
+
+func uniqueComparisonOutputName(name string, used map[string]struct{}) string {
+	if name == "" {
+		name = "pprof"
+	}
+	candidate := name
+	for suffix := 2; ; suffix++ {
+		key := strings.ToLower(candidate)
+		if _, exists := used[key]; !exists {
+			used[key] = struct{}{}
+			return candidate
+		}
+		extension := filepath.Ext(name)
+		stem := strings.TrimSuffix(name, extension)
+		candidate = fmt.Sprintf("%s__%d%s", stem, suffix, extension)
+	}
+}
+
+func replaceOutputDirectory(temporaryDir string, outputDir string) error {
+	if err := os.RemoveAll(outputDir); err != nil {
+		return err
+	}
+	return os.Rename(temporaryDir, outputDir)
+}
+
+func defaultRunPprofDiff(ctx context.Context, baseProfilePath string, targetProfilePath string, outputPath string) error {
+	if _, err := exec.LookPath("go"); err != nil {
+		return errors.New("没有找到 go 命令，请确认 Go 已安装并在 PATH 中")
+	}
+
+	output, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "go", pprofDiffCommandArgs(baseProfilePath, targetProfilePath)...)
+	cmd.Stdout = output
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = windowsHideConsole()
+	}
+	runErr := cmd.Run()
+	closeErr := output.Close()
+	if runErr != nil {
+		_ = os.Remove(outputPath)
+		if message := strings.TrimSpace(stderr.String()); message != "" {
+			return fmt.Errorf("go tool pprof: %w: %s", runErr, message)
+		}
+		return fmt.Errorf("go tool pprof: %w", runErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(outputPath)
+		return closeErr
+	}
+	return nil
+}
+
+func pprofDiffCommandArgs(baseProfilePath string, targetProfilePath string) []string {
+	return []string{"tool", "pprof", "-proto", "-diff_base=" + baseProfilePath, targetProfilePath}
 }
 
 func normalizeDir(input string) (string, error) {
@@ -961,15 +1314,39 @@ func filterProfilesByDirs(profiles []profileFile, dirs []string) []profileFile {
 }
 
 func cloneTab(tab *browserTab) tabSummary {
-	return tabSummary{ID: tab.ID, Name: tab.Name}
+	return tabSummary{ID: tab.ID, Name: tab.Name, CreatedAt: tab.CreatedAt}
 }
 
 func cloneTabs(tabs []*browserTab) []tabSummary {
-	cloned := make([]tabSummary, len(tabs))
-	for i, tab := range tabs {
+	sorted := append([]*browserTab(nil), tabs...)
+	sortTabsByCreatedAt(sorted)
+	cloned := make([]tabSummary, len(sorted))
+	for i, tab := range sorted {
 		cloned[i] = cloneTab(tab)
 	}
 	return cloned
+}
+
+func newestTab(tabs []*browserTab) *browserTab {
+	if len(tabs) == 0 {
+		return nil
+	}
+	newest := tabs[0]
+	for _, tab := range tabs[1:] {
+		if tab.CreatedAt.After(newest.CreatedAt) {
+			newest = tab
+		}
+	}
+	return newest
+}
+
+func sortTabsByCreatedAt(tabs []*browserTab) {
+	sort.SliceStable(tabs, func(i, j int) bool {
+		if tabs[i].CreatedAt.Equal(tabs[j].CreatedAt) {
+			return tabs[i].ID > tabs[j].ID
+		}
+		return tabs[i].CreatedAt.After(tabs[j].CreatedAt)
+	})
 }
 
 func cloneStrings(values []string) []string {

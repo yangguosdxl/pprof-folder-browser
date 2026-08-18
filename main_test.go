@@ -12,11 +12,44 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type selectDirResponse struct {
 	Path     string `json:"path"`
 	Canceled bool   `json:"canceled"`
+}
+
+func Test页签列表按加入时间倒序返回且全局清理跨页签生效(t *testing.T) {
+	state := newAppState()
+	older := state.tabs[0]
+	older.CreatedAt = time.Now().Add(-time.Hour)
+	newer := newBrowserTab("tab-2", "新页签")
+	newer.CreatedAt = time.Now()
+	state.tabs = append(state.tabs, newer)
+	newer.Sessions["session"] = &pprofSession{ID: "session", Cmd: &exec.Cmd{}}
+
+	list := httptest.NewRecorder()
+	state.handleListTabs(list, httptest.NewRequest(http.MethodGet, "/api/tabs", nil))
+	var response tabsResponse
+	if err := json.NewDecoder(list.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Tabs) != 2 || response.Tabs[0].ID != newer.ID {
+		t.Fatalf("页签顺序 = %#v，期望最新页签在首位", response.Tabs)
+	}
+	if response.ActiveTabID != newer.ID {
+		t.Fatalf("活动页签 = %q，期望 %q", response.ActiveTabID, newer.ID)
+	}
+
+	originalKillProcessTree := killProcessTree
+	killProcessTree = func(*exec.Cmd) error { return nil }
+	defer func() { killProcessTree = originalKillProcessTree }()
+	clear := httptest.NewRecorder()
+	state.handleClearSessions(clear, httptest.NewRequest(http.MethodDelete, "/api/sessions", nil))
+	if clear.Code != http.StatusOK || len(newer.Sessions) != 0 {
+		t.Fatalf("全局清理状态码 = %d，会话数 = %d", clear.Code, len(newer.Sessions))
+	}
 }
 
 type clearSessionsResponse struct {
@@ -125,7 +158,7 @@ func Test可以新增页签并保存改名到服务器状态(t *testing.T) {
 	if len(listed.Tabs) != 2 {
 		t.Fatalf("页签数量 = %d，期望 2", len(listed.Tabs))
 	}
-	if listed.Tabs[1].Name != "线上 CPU" {
+	if listed.Tabs[0].ID != created.Tab.ID || listed.Tabs[0].Name != "线上 CPU" {
 		t.Fatalf("服务端保存的页签名 = %q，期望 %q", listed.Tabs[1].Name, "线上 CPU")
 	}
 }
@@ -280,7 +313,7 @@ func Test状态文件会在重启后恢复页签目录和扫描结果(t *testing
 	if len(tabs.Tabs) != 2 {
 		t.Fatalf("恢复后的页签数量 = %d，期望 2", len(tabs.Tabs))
 	}
-	if tabs.Tabs[1].Name != "重启后保留" {
+	if tabs.Tabs[0].Name != "重启后保留" {
 		t.Fatalf("恢复后的第二个页签名 = %q，期望 %q", tabs.Tabs[1].Name, "重启后保留")
 	}
 
@@ -676,5 +709,238 @@ func TestPprof页面URL遇到零地址时回退本机地址(t *testing.T) {
 
 	if url != "http://127.0.0.1:38080" {
 		t.Fatalf("pprof URL = %q，期望 %q", url, "http://127.0.0.1:38080")
+	}
+}
+
+func useWorkingDirectory(t *testing.T, dir string) {
+	t.Helper()
+	current, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(current); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+}
+
+func TestCompareTabsWritesDiffsOverExistingResultAndCreatesResultTab(t *testing.T) {
+	workDir := t.TempDir()
+	useWorkingDirectory(t, workDir)
+
+	state := newAppState()
+	state.tabs[0].Name = "baseline"
+	state.tabs[0].Profiles = []profileFile{
+		{Name: "cpu.pprof", Path: filepath.Join(workDir, "baseline", "cpu.pprof")},
+		{Name: "heap.pprof", Path: filepath.Join(workDir, "baseline", "heap.pprof")},
+	}
+	second := newBrowserTab("tab-2", "candidate")
+	second.Profiles = []profileFile{
+		{Name: "cpu.pprof", Path: filepath.Join(workDir, "candidate", "cpu.pprof")},
+		{Name: "heap.pprof", Path: filepath.Join(workDir, "candidate", "heap.pprof")},
+	}
+	state.tabs = append(state.tabs, second)
+	state.nextTabNumber = 3
+
+	expectedOutputDir := filepath.Join(workDir, diffResultDirName, "baseline vs candidate")
+	if err := os.MkdirAll(expectedOutputDir, 0o755); err != nil {
+		t.Fatalf("create existing result directory: %v", err)
+	}
+	oldFile := filepath.Join(expectedOutputDir, "old.pprof")
+	if err := os.WriteFile(oldFile, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write old result: %v", err)
+	}
+
+	originalRunPprofDiff := runPprofDiff
+	t.Cleanup(func() { runPprofDiff = originalRunPprofDiff })
+	type call struct {
+		base   string
+		target string
+	}
+	calls := make([]call, 0)
+	runPprofDiff = func(_ context.Context, base string, target string, output string) error {
+		calls = append(calls, call{base: base, target: target})
+		return os.WriteFile(output, []byte(base+"->"+target), 0o644)
+	}
+
+	body, err := json.Marshal(compareProfilesRequest{FirstTabID: "tab-1", SecondTabID: "tab-2"})
+	if err != nil {
+		t.Fatalf("marshal compare request: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	state.handleCompareProfiles(recorder, httptest.NewRequest(http.MethodPost, "/api/compare", bytes.NewReader(body)))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("compare status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	var response compareProfilesResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode compare response: %v", err)
+	}
+	if response.OutputDir != expectedOutputDir {
+		t.Fatalf("output directory = %q, want %q", response.OutputDir, expectedOutputDir)
+	}
+	if response.Compared != 2 {
+		t.Fatalf("compared = %d, want 2", response.Compared)
+	}
+	if len(response.Warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", response.Warnings)
+	}
+	if response.Tab.ID != "tab-3" || response.Tab.Name != "baseline vs candidate" {
+		t.Fatalf("result tab = %#v", response.Tab)
+	}
+	if len(response.Profiles) != 2 {
+		t.Fatalf("result profiles = %#v, want 2", response.Profiles)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("diff command calls = %#v, want 2", calls)
+	}
+	if calls[0].base != state.tabs[0].Profiles[0].Path || calls[0].target != second.Profiles[0].Path {
+		t.Fatalf("first diff call = %#v", calls[0])
+	}
+	if calls[1].base != state.tabs[0].Profiles[1].Path || calls[1].target != second.Profiles[1].Path {
+		t.Fatalf("second diff call = %#v", calls[1])
+	}
+	if _, err := os.Stat(oldFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old result was not replaced: %v", err)
+	}
+	for _, name := range []string{"cpu.pprof", "heap.pprof"} {
+		if _, err := os.Stat(filepath.Join(expectedOutputDir, name)); err != nil {
+			t.Fatalf("missing diff output %q: %v", name, err)
+		}
+	}
+	if len(state.tabs) != 3 || len(state.tabs[2].Dirs) != 1 || state.tabs[2].Dirs[0] != expectedOutputDir {
+		t.Fatalf("result tab state = %#v", state.tabs)
+	}
+}
+
+func TestCompareTabsSkipsDuplicateNamesAndReportsWarnings(t *testing.T) {
+	workDir := t.TempDir()
+	useWorkingDirectory(t, workDir)
+
+	state := newAppState()
+	state.tabs[0].Name = "baseline"
+	state.tabs[0].Profiles = []profileFile{
+		{Name: "cpu.pprof", Path: filepath.Join(workDir, "baseline", "one", "cpu.pprof")},
+		{Name: "cpu.pprof", Path: filepath.Join(workDir, "baseline", "two", "cpu.pprof")},
+		{Name: "heap.pprof", Path: filepath.Join(workDir, "baseline", "heap.pprof")},
+	}
+	second := newBrowserTab("tab-2", "candidate")
+	second.Profiles = []profileFile{
+		{Name: "cpu.pprof", Path: filepath.Join(workDir, "candidate", "cpu.pprof")},
+		{Name: "heap.pprof", Path: filepath.Join(workDir, "candidate", "heap.pprof")},
+	}
+	state.tabs = append(state.tabs, second)
+	state.nextTabNumber = 3
+
+	originalRunPprofDiff := runPprofDiff
+	t.Cleanup(func() { runPprofDiff = originalRunPprofDiff })
+	calls := 0
+	runPprofDiff = func(_ context.Context, _ string, _ string, output string) error {
+		calls++
+		return os.WriteFile(output, []byte("diff"), 0o644)
+	}
+
+	body, err := json.Marshal(compareProfilesRequest{FirstTabID: "tab-1", SecondTabID: "tab-2"})
+	if err != nil {
+		t.Fatalf("marshal compare request: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	state.handleCompareProfiles(recorder, httptest.NewRequest(http.MethodPost, "/api/compare", bytes.NewReader(body)))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("compare status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	var response compareProfilesResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode compare response: %v", err)
+	}
+	if response.Compared != 1 || calls != 1 {
+		t.Fatalf("compared = %d, calls = %d, want 1", response.Compared, calls)
+	}
+	if len(response.Warnings) != 1 || !strings.Contains(response.Warnings[0], "cpu.pprof") {
+		t.Fatalf("warnings = %#v", response.Warnings)
+	}
+	if _, err := os.Stat(filepath.Join(response.OutputDir, "heap.pprof")); err != nil {
+		t.Fatalf("missing unique diff output: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(response.OutputDir, "cpu.pprof")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("duplicate diff output should not exist: %v", err)
+	}
+}
+
+func TestPprofDiffCommandArgs(t *testing.T) {
+	args := pprofDiffCommandArgs(`D:\profiles\baseline.pprof`, `D:\profiles\candidate.pprof`)
+	expected := []string{
+		"tool",
+		"pprof",
+		"-proto",
+		`-diff_base=D:\profiles\baseline.pprof`,
+		`D:\profiles\candidate.pprof`,
+	}
+	if strings.Join(args, "\n") != strings.Join(expected, "\n") {
+		t.Fatalf("diff args = %#v, want %#v", args, expected)
+	}
+}
+
+func TestComparisonFolderNameSanitizesInvalidPathCharacters(t *testing.T) {
+	if got := comparisonFolderName(`baseline: 1`, `candidate/2`); got != "baseline_ 1 vs candidate_2" {
+		t.Fatalf("comparison folder = %q", got)
+	}
+}
+
+func TestStaticPageIncludesCompareControls(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	staticHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("static page status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `id="compareTabSelect"`) || !strings.Contains(body, `id="compareBtn"`) {
+		t.Fatalf("static page does not include compare controls")
+	}
+}
+
+func TestStaticPageUsesEmbeddedBrowserDependencies(t *testing.T) {
+	handler := staticHandler()
+	indexRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(indexRecorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if indexRecorder.Code != http.StatusOK {
+		t.Fatalf("static page status = %d, want %d", indexRecorder.Code, http.StatusOK)
+	}
+	index := indexRecorder.Body.String()
+	if strings.Contains(index, `src="http://`) || strings.Contains(index, `src="https://`) ||
+		strings.Contains(index, `href="http://`) || strings.Contains(index, `href="https://`) {
+		t.Fatal("static page references a remote browser dependency")
+	}
+
+	assets := []string{
+		"/vendor/jquery/jquery-3.7.1.min.js",
+		"/vendor/jstree/jstree.min.js",
+		"/vendor/jstree/themes/default/style.min.css",
+		"/vendor/jstree/themes/default/32px.png",
+		"/vendor/jstree/themes/default/40px.png",
+		"/vendor/jstree/themes/default/throbber.gif",
+	}
+	for _, asset := range assets {
+		if (strings.HasSuffix(asset, ".js") || strings.HasSuffix(asset, ".css")) &&
+			!strings.Contains(index, asset) {
+			t.Errorf("static page does not reference local asset %q", asset)
+		}
+
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, asset, nil))
+		if recorder.Code != http.StatusOK {
+			t.Errorf("embedded asset %q status = %d, want %d", asset, recorder.Code, http.StatusOK)
+		}
+		if recorder.Body.Len() == 0 {
+			t.Errorf("embedded asset %q is empty", asset)
+		}
 	}
 }

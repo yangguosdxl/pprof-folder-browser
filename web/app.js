@@ -2,6 +2,7 @@ const state = {
   tabs: [],
   activeTabId: "",
   editingTabId: "",
+  comparing: false,
   views: {},
 };
 
@@ -25,6 +26,8 @@ const dirInput = browserDocument?.querySelector("#dirInput");
 const chooseDirBtn = browserDocument?.querySelector("#chooseDirBtn");
 const dirList = browserDocument?.querySelector("#dirList");
 const scanBtn = browserDocument?.querySelector("#scanBtn");
+const compareTabSelect = browserDocument?.querySelector("#compareTabSelect");
+const compareBtn = browserDocument?.querySelector("#compareBtn");
 const filterInput = browserDocument?.querySelector("#filterInput");
 const profileTree = browserDocument?.querySelector("#profileTree");
 const profileDetail = browserDocument?.querySelector("#profileDetail");
@@ -209,9 +212,17 @@ function pathWithTab(path, tabId = state.activeTabId) {
 }
 
 function renderTabs() {
-  if (!tabList) return;
+  if (!tabList) {
+    renderCompareControls();
+    return;
+  }
 
-  tabList.innerHTML = state.tabs
+  // 前端再次排序，确保接口数据或旧缓存顺序异常时左侧栏仍按加入时间倒序。
+  const sortedTabs = [...state.tabs].sort((a, b) => {
+    const timeDiff = Date.parse(b.createdAt || "") - Date.parse(a.createdAt || "");
+    return Number.isNaN(timeDiff) || timeDiff === 0 ? b.id.localeCompare(a.id) : timeDiff;
+  });
+  tabList.innerHTML = sortedTabs
     .map((tab) => {
       const active = tab.id === state.activeTabId;
       const editing = tab.id === state.editingTabId;
@@ -273,6 +284,29 @@ function renderTabs() {
     .join("");
 
   focusEditingTabInput();
+  renderCompareControls();
+}
+
+function renderCompareControls() {
+  if (!compareTabSelect || !compareBtn) return;
+
+  const candidates = state.tabs.filter((tab) => tab.id !== state.activeTabId);
+  const selectedTabId = candidates.some((tab) => tab.id === compareTabSelect.value)
+    ? compareTabSelect.value
+    : candidates[0]?.id || "";
+
+  if (candidates.length === 0) {
+    compareTabSelect.innerHTML = `<option value="">没有可对比的页签</option>`;
+  } else {
+    compareTabSelect.innerHTML = candidates
+      .map((tab) => `<option value="${escapeHtml(tab.id)}">${escapeHtml(tab.name)}</option>`)
+      .join("");
+    compareTabSelect.value = selectedTabId;
+  }
+
+  const canCompare = Boolean(activeTab() && selectedTabId);
+  compareTabSelect.disabled = state.comparing || !canCompare;
+  compareBtn.disabled = state.comparing || !canCompare;
 }
 
 function renderDirs() {
@@ -491,7 +525,8 @@ function syncSelectedProfile(view) {
 
 function renderSessions() {
   const view = currentView();
-  clearSessionsBtn.disabled = view.sessions.length === 0;
+  // 这是跨页签的全局操作，不能依据当前页签的会话数量禁用。
+  clearSessionsBtn.disabled = false;
 
   if (view.sessions.length === 0) {
     sessionList.innerHTML = `<div class="empty">尚未打开任何 pprof 页面</div>`;
@@ -975,6 +1010,49 @@ async function loadProfiles() {
   }
 }
 
+async function compareTabs() {
+  const firstTab = activeTab();
+  const secondTabId = compareTabSelect?.value || "";
+  const secondTab = state.tabs.find((tab) => tab.id === secondTabId);
+  if (!firstTab || !secondTab || state.comparing) return;
+
+  state.comparing = true;
+  compareBtn.textContent = "对比中";
+  renderCompareControls();
+  try {
+    const data = await api("/api/compare", {
+      method: "POST",
+      body: JSON.stringify({ firstTabId: firstTab.id, secondTabId: secondTab.id }),
+    });
+    for (const warning of data.warnings || []) {
+      log(`警告：${warning}`);
+    }
+    log(`已完成 ${data.compared || 0} 个同名 pprof 的差分：${data.outputDir}`);
+
+    if (data.tab?.id) {
+      state.tabs = state.tabs.some((tab) => tab.id === data.tab.id)
+        ? state.tabs.map((tab) => (tab.id === data.tab.id ? data.tab : tab))
+        : [...state.tabs, data.tab];
+      state.activeTabId = data.tab.id;
+      storeActiveTabId(state.activeTabId);
+      const view = ensureTabView(data.tab.id);
+      view.dirs = data.outputDir ? [data.outputDir] : [];
+      view.profiles = data.profiles || [];
+      view.sessions = [];
+      view.selectedProfileId = view.profiles[0]?.id || "";
+      renderAll();
+      await loadActiveTabData();
+    }
+  } catch (error) {
+    log(error.message);
+    alert(error.message);
+  } finally {
+    state.comparing = false;
+    compareBtn.textContent = "对比";
+    renderCompareControls();
+  }
+}
+
 async function scanProfiles() {
   const tabId = state.activeTabId;
   scanBtn.disabled = true;
@@ -1010,7 +1088,7 @@ async function clearSessions() {
   clearSessionsBtn.disabled = true;
   clearSessionsBtn.textContent = "清除中";
   try {
-    const data = await api(pathWithTab("/api/sessions", tabId), { method: "DELETE" });
+    const data = await api("/api/sessions", { method: "DELETE" });
     log(`已清除 ${data.cleared || 0} 个 pprof 进程`);
     await loadSessions();
   } catch (error) {
@@ -1018,7 +1096,7 @@ async function clearSessions() {
     alert(error.message);
   } finally {
     clearSessionsBtn.textContent = "清除全部";
-    clearSessionsBtn.disabled = currentView().sessions.length === 0;
+    clearSessionsBtn.disabled = false;
   }
 }
 
@@ -1173,6 +1251,7 @@ function boot() {
   });
 
   scanBtn.addEventListener("click", scanProfiles);
+  compareBtn.addEventListener("click", compareTabs);
   chooseDirBtn.addEventListener("click", chooseDir);
   clearSessionsBtn.addEventListener("click", clearSessions);
   sortNameBtn.addEventListener("click", () => toggleSort("name"));

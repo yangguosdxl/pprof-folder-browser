@@ -25,7 +25,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -88,6 +89,18 @@ button:disabled {
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 16px;
+}
+
+.toolbar-actions,
+.compare-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.compare-controls select {
+  min-width: 150px;
+  max-width: 260px;
 }
 
 h1 {
@@ -315,7 +328,8 @@ body.resizing-sidebar {
   white-space: nowrap;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 38px;
   border: 1px solid var(--line);
@@ -325,7 +339,8 @@ input {
   color: var(--text);
 }
 
-input:focus {
+input:focus,
+select:focus {
   outline: 2px solid rgba(23, 105, 170, 0.2);
   border-color: var(--accent);
 }
@@ -641,6 +656,16 @@ tbody tr:hover {
   .list-head {
     grid-template-columns: 1fr;
     display: grid;
+  }
+
+  .toolbar-actions,
+  .compare-controls {
+    width: 100%;
+  }
+
+  .compare-controls select {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .summary {

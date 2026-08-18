@@ -1,4 +1,5 @@
 .gocache/
+diff-result/
 *.exe
 *.exe~
 *.log

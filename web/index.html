@@ -42,7 +42,13 @@
             <h1>pprof 文件浏览器</h1>
             <p>加载多个目录，点击 profile 文件后用浏览器打开对应的 go tool pprof Web UI。</p>
           </div>
-          <button id="scanBtn" class="primary">扫描</button>
+          <div class="toolbar-actions">
+            <div class="compare-controls">
+              <select id="compareTabSelect" aria-label="选择要比较的页签"></select>
+              <button id="compareBtn" type="button" title="对比当前页签与所选页签中的同名 pprof">对比</button>
+            </div>
+            <button id="scanBtn" class="primary">扫描</button>
+          </div>
         </section>
 
         <section class="panel">
