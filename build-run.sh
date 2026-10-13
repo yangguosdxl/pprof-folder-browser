@@ -21,12 +21,12 @@ stop_running_service() {
     pkill -x "$app_name" >/dev/null 2>&1 || true
   fi
 
-  # Give Windows time to release the previous executable before rebuilding it.
+  # 给 Windows 留出释放旧可执行文件的时间，再开始重新构建。
   sleep 1
 }
 
 if ! command -v go >/dev/null 2>&1; then
-  echo "go command was not found in PATH" >&2
+  echo "未在 PATH 中找到 go 命令" >&2
   exit 1
 fi
 
@@ -38,7 +38,7 @@ fi
 
 stop_running_service
 
-echo "Building $app_name..."
+echo "正在构建 $app_name..."
 (
   cd "$script_dir"
   go build -o "$binary" .
@@ -46,7 +46,7 @@ echo "Building $app_name..."
 
 : > "$stdout_log"
 : > "$stderr_log"
-echo "Starting $app_name..."
+echo "正在启动 $app_name..."
 nohup "$binary" >"$stdout_log" 2>"$stderr_log" < /dev/null &
 server_pid=$!
 disown "$server_pid" 2>/dev/null || true
@@ -57,15 +57,22 @@ url="http://127.0.0.1:$port"
 
 if command -v curl >/dev/null 2>&1; then
   for _ in {1..20}; do
-    if curl --silent --fail --max-time 1 "$url/api/tabs" >/dev/null 2>&1; then
-      echo "Started: $url"
+    if curl --noproxy "*" --silent --fail --max-time 1 "$url/api/tabs" >/dev/null 2>&1; then
+      echo "启动成功：$url"
       exit 0
     fi
+
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      echo "服务进程在响应 $url 前已经退出，请查看：$stderr_log" >&2
+      tail -n 20 "$stderr_log" >&2 || true
+      exit 1
+    fi
+
     sleep 0.25
   done
 
-  echo "The process started but did not respond at $url. See $stderr_log" >&2
+  echo "服务进程已经启动，但未响应 $url，请查看：$stderr_log" >&2
   exit 1
 fi
 
-echo "Started: $url"
+echo "启动成功：$url"

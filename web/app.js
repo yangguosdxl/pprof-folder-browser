@@ -431,7 +431,7 @@ function renderFallbackNodes(nodes) {
       if (profile) {
         return `
           <li>
-            <button class="fallback-profile" type="button" data-select-id="${escapeHtml(profile.id)}">
+            <button class="fallback-profile" type="button" data-select-id="${escapeHtml(profile.id)}" title="${escapeHtml(profile.path)}">
               ${escapeHtml(profile.name)}
             </button>
           </li>
@@ -695,6 +695,8 @@ function profileNode(profile) {
     id: profileNodeId(profile.id),
     text: profile.name,
     type: "profile",
+    // 使用浏览器原生悬浮提示展示完整路径，选中不会改变省略或移开后的行为。
+    a_attr: { title: profile.path },
     data: {
       kind: "profile",
       profile,

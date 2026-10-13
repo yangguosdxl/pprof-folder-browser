@@ -402,8 +402,16 @@ select:focus {
 
 .profile-tree {
   min-width: 0;
+  overflow: hidden;
   padding: 12px;
   border-right: 1px solid var(--line);
+}
+
+/* 整行选中插件默认使用行内块，需限制根节点宽度，长文件名才能按栏宽省略。 */
+.profile-tree .jstree-container-ul {
+  display: block;
+  width: 100%;
+  min-width: 0;
 }
 
 .profile-tree .jstree-anchor {
@@ -499,6 +507,11 @@ select:focus {
 }
 
 .fallback-profile {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
   min-height: 0;
   border: 0;
   background: transparent;
