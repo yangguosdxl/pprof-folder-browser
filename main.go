@@ -1426,7 +1426,14 @@ func startPprof(profile profileFile, urlHost string) (*pprofSession, error) {
 
 func pprofCommandArgs(port int, profilePath string) []string {
 	// pprof 默认会自动打开浏览器；前端已经负责 window.open，这里关闭自动打开以避免重复页面。
-	return []string{"tool", "pprof", "-http=" + net.JoinHostPort(pprofListenHost, strconv.Itoa(port)), "-no_browser", profilePath}
+	args := []string{"tool", "pprof", "-http=" + net.JoinHostPort(pprofListenHost, strconv.Itoa(port)), "-no_browser"}
+	name := strings.ToLower(filepath.Base(profilePath))
+	if name == "unityobjects_instance_memory.pprof" || name == "unityobjects_instance_count.pprof" || name == "unityobjects_resources.pprof" {
+		// Web UI 未提供标签伪栈开关：启动时按资源身份分组，真实调用栈及 unkdown 继续保留。
+		// resourceKey 对未映射资源也有稳定记录身份，避免丢失资源路径为空的样本。
+		args = append(args, "-tagroot=resourceKey")
+	}
+	return append(args, profilePath)
 }
 
 func freePort() (int, error) {

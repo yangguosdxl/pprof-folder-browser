@@ -14,6 +14,7 @@
 - 支持按文件名、文件大小排序；目录始终排在文件前。
 - 点击 profile 文件后自动执行 `go tool pprof -http`，并在浏览器新窗口打开 pprof Web UI。
 - 对同一个 profile 会复用已启动的 pprof 会话。
+- UnityObjects 的实例内存、实例数量、资源三类 profile 自动按 `resourceKey` 资源身份分组，保留创建/加载调用栈及无法归因的 `unkdown`。进入 pprof 页面后可在 `Sample` 菜单切换内存分量或资源数量；标签筛选使用原生 pprof 的 `tagfocus`。
 - 可清除当前页签下已启动的 pprof 进程。
 
 扫描会识别以下文件：

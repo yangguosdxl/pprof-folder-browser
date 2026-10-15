@@ -693,6 +693,21 @@ func TestPprof启动参数禁用自动打开浏览器(t *testing.T) {
 	}
 }
 
+func TestUnityObjects三类Profile启动时保留资源身份分组(t *testing.T) {
+	for _, name := range []string{"unityobjects_instance_memory.pprof", "unityobjects_instance_count.pprof", "unityobjects_resources.pprof"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			args := pprofCommandArgs(38080, path)
+			if !strings.Contains(strings.Join(args, "\n"), "-tagroot=resourceKey") {
+				t.Fatalf("UnityObjects 未按资源身份分组：%#v", args)
+			}
+			if args[len(args)-1] != path {
+				t.Fatalf("profile 路径参数丢失：%#v", args)
+			}
+		})
+	}
+}
+
 func TestPprof页面URL使用当前请求Host(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:18080/api/sessions", nil)
 	url := pprofWebURL(publicHostFromRequest(request), 38080)
