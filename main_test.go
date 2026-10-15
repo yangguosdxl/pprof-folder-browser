@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -705,6 +707,52 @@ func TestUnityObjects三类Profile启动时保留资源身份分组(t *testing.T
 				t.Fatalf("profile 路径参数丢失：%#v", args)
 			}
 		})
+	}
+}
+
+func Test资源驻留全部缺失时仅信任匹配清单并默认数量(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unityobjects_resources.pprof")
+	data := []byte("隔离测试 profile")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	manifestPath := filepath.Join(dir, "unityobjects_pprof_manifest.json")
+	for _, tc := range []struct {
+		name, status, hash string
+		samples, missing   int
+		want               bool
+	}{
+		{"全部缺失", "complete", hex.EncodeToString(digest[:]), 3, 3, true},
+		{"部分缺失", "complete", hex.EncodeToString(digest[:]), 3, 2, false},
+		{"真实零值", "complete", hex.EncodeToString(digest[:]), 3, 0, false},
+		{"哈希错误", "complete", "wrong", 3, 3, false},
+		{"清单未完成", "partial", hex.EncodeToString(digest[:]), 3, 3, false},
+		{"空样本", "complete", hex.EncodeToString(digest[:]), 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := map[string]any{"status": tc.status, "profiles": []any{map[string]any{
+				"file": filepath.Base(path), "sha256": tc.hash, "sampleCount": tc.samples,
+				"coverage": map[string]any{"missingValues": map[string]int{"resource_resident": tc.missing}},
+			}}}
+			content, _ := json.Marshal(manifest)
+			if err := os.WriteFile(manifestPath, content, 0600); err != nil {
+				t.Fatal(err)
+			}
+			profile := profileFile{Path: path}
+			applyUnityObjectsMetricAvailability(&profile)
+			if (profile.PreferredSample == "resource_count") != tc.want || (profile.MetricNotice != "") != tc.want {
+				t.Fatalf("缺失语义与预期不符：%+v", profile)
+			}
+			args := strings.Join(pprofCommandArgs(38080, path), "\n")
+			if strings.Contains(args, "-sample_index=resource_count") != tc.want {
+				t.Fatalf("默认指标启动参数不符：%s", args)
+			}
+		})
+	}
+	if got := profileSessionURL("127.0.0.1", 38080, "resource_count"); got != "http://127.0.0.1:38080/ui/flamegraph?si=resource_count" {
+		t.Fatalf("数量页 URL 不符：%s", got)
 	}
 }
 

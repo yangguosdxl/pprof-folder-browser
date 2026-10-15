@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -71,23 +72,27 @@ type tabSummary struct {
 }
 
 type profileFile struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Dir      string `json:"dir"`
-	Size     int64  `json:"size"`
-	Modified string `json:"modified"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Path            string `json:"path"`
+	Dir             string `json:"dir"`
+	Size            int64  `json:"size"`
+	Modified        string `json:"modified"`
+	MetricNotice    string `json:"metricNotice,omitempty"`
+	PreferredSample string `json:"preferredSample,omitempty"`
 }
 
 type pprofSession struct {
-	ID        string    `json:"id"`
-	ProfileID string    `json:"profileId"`
-	Path      string    `json:"path"`
-	URL       string    `json:"url"`
-	Port      int       `json:"port"`
-	StartedAt time.Time `json:"startedAt"`
-	Cmd       *exec.Cmd `json:"-"`
-	Cancel    func()    `json:"-"`
+	ID              string    `json:"id"`
+	ProfileID       string    `json:"profileId"`
+	Path            string    `json:"path"`
+	URL             string    `json:"url"`
+	Port            int       `json:"port"`
+	StartedAt       time.Time `json:"startedAt"`
+	Cmd             *exec.Cmd `json:"-"`
+	Cancel          func()    `json:"-"`
+	MetricNotice    string    `json:"metricNotice,omitempty"`
+	PreferredSample string    `json:"preferredSample,omitempty"`
 }
 
 type addDirRequest struct {
@@ -1257,14 +1262,16 @@ func scanProfiles(dirs []string) ([]profileFile, error) {
 				log.Printf("读取文件信息失败：%s，错误：%v", path, err)
 				return nil
 			}
-			profiles = append(profiles, profileFile{
+			profile := profileFile{
 				ID:       stableID(path),
 				Name:     filepath.Base(path),
 				Path:     path,
 				Dir:      root,
 				Size:     info.Size(),
 				Modified: info.ModTime().Format(time.RFC3339),
-			})
+			}
+			applyUnityObjectsMetricAvailability(&profile)
+			profiles = append(profiles, profile)
 			return nil
 		})
 		if err != nil {
@@ -1371,10 +1378,58 @@ func sessionURLForHost(session *pprofSession, urlHost string) string {
 	if session.Port == 0 {
 		return session.URL
 	}
-	return pprofWebURL(urlHost, session.Port)
+	return profileSessionURL(urlHost, session.Port, session.PreferredSample)
+}
+
+func profileSessionURL(host string, port int, sample string) string {
+	url := pprofWebURL(host, port)
+	if sample == "resource_count" {
+		return url + "/ui/flamegraph?si=resource_count"
+	}
+	return url
+}
+
+func applyUnityObjectsMetricAvailability(profile *profileFile) {
+	// 只信任与实际 pprof 文件哈希一致的完成清单，防止旧 sidecar 将已采集数值误标为缺失。
+	profile.MetricNotice, profile.PreferredSample = "", ""
+	if strings.ToLower(filepath.Base(profile.Path)) != "unityobjects_resources.pprof" {
+		return
+	}
+	var manifest struct {
+		Status   string `json:"status"`
+		Profiles []struct {
+			File        string `json:"file"`
+			SHA256      string `json:"sha256"`
+			SampleCount int    `json:"sampleCount"`
+			Coverage    struct {
+				MissingValues map[string]int `json:"missingValues"`
+			} `json:"coverage"`
+		} `json:"profiles"`
+	}
+	content, err := os.ReadFile(filepath.Join(filepath.Dir(profile.Path), "unityobjects_pprof_manifest.json"))
+	if err != nil || json.Unmarshal(content, &manifest) != nil || manifest.Status != "complete" {
+		return
+	}
+	for _, row := range manifest.Profiles {
+		if row.File != filepath.Base(profile.Path) || row.SampleCount <= 0 || row.Coverage.MissingValues["resource_resident"] != row.SampleCount {
+			continue
+		}
+		data, err := os.ReadFile(profile.Path)
+		if err != nil {
+			return
+		}
+		digest := sha256.Sum256(data)
+		if row.SHA256 != hex.EncodeToString(digest[:]) {
+			return
+		}
+		profile.MetricNotice = "本轮未采集资源驻留内存，当前展示资源数量。"
+		profile.PreferredSample = "resource_count"
+		return
+	}
 }
 
 func startPprof(profile profileFile, urlHost string) (*pprofSession, error) {
+	applyUnityObjectsMetricAvailability(&profile)
 	if _, err := exec.LookPath("go"); err != nil {
 		return nil, errors.New("没有找到 go 命令，请确认 Go 已安装并在 PATH 中")
 	}
@@ -1383,7 +1438,7 @@ func startPprof(profile profileFile, urlHost string) (*pprofSession, error) {
 		return nil, fmt.Errorf("分配本地端口失败：%v", err)
 	}
 
-	url := pprofWebURL(urlHost, port)
+	url := profileSessionURL(urlHost, port, profile.PreferredSample)
 	ctx, cancel := context.WithCancel(context.Background())
 	args := pprofCommandArgs(port, profile.Path)
 	cmd := exec.CommandContext(ctx, "go", args...)
@@ -1413,14 +1468,16 @@ func startPprof(profile profileFile, urlHost string) (*pprofSession, error) {
 	// pprof Web UI 启动需要一点时间，前端打开新窗口后浏览器会自动等待。
 	sessionID := stableID(profile.Path + "|" + strconv.Itoa(port) + "|" + time.Now().Format(time.RFC3339Nano))
 	return &pprofSession{
-		ID:        sessionID,
-		ProfileID: profile.ID,
-		Path:      profile.Path,
-		URL:       url,
-		Port:      port,
-		StartedAt: time.Now(),
-		Cmd:       cmd,
-		Cancel:    cancel,
+		ID:              sessionID,
+		ProfileID:       profile.ID,
+		Path:            profile.Path,
+		URL:             url,
+		Port:            port,
+		StartedAt:       time.Now(),
+		Cmd:             cmd,
+		Cancel:          cancel,
+		MetricNotice:    profile.MetricNotice,
+		PreferredSample: profile.PreferredSample,
 	}, nil
 }
 
@@ -1432,6 +1489,12 @@ func pprofCommandArgs(port int, profilePath string) []string {
 		// Web UI 未提供标签伪栈开关：启动时按资源身份分组，真实调用栈及 unkdown 继续保留。
 		// resourceKey 对未映射资源也有稳定记录身份，避免丢失资源路径为空的样本。
 		args = append(args, "-tagroot=resourceKey")
+	}
+	profile := profileFile{Path: profilePath}
+	applyUnityObjectsMetricAvailability(&profile)
+	if profile.PreferredSample == "resource_count" {
+		// 改变浏览器默认视图，不修改原始 pprof 的 default_sample_type。
+		args = append(args, "-sample_index=resource_count")
 	}
 	return append(args, profilePath)
 }

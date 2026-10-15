@@ -646,6 +646,15 @@ tbody tr:hover {
   white-space: pre-wrap;
 }
 
+.metric-notice {
+  padding: 10px;
+  border-left: 3px solid #b7791f;
+  background: #fff7e6;
+  color: #744210;
+  line-height: 1.6;
+  white-space: normal;
+}
+
 @media (max-width: 760px) {
   .shell {
     grid-template-columns: 1fr;

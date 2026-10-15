@@ -15,6 +15,7 @@
 - 点击 profile 文件后自动执行 `go tool pprof -http`，并在浏览器新窗口打开 pprof Web UI。
 - 对同一个 profile 会复用已启动的 pprof 会话。
 - UnityObjects 的实例内存、实例数量、资源三类 profile 自动按 `resourceKey` 资源身份分组，保留创建/加载调用栈及无法归因的 `unkdown`。进入 pprof 页面后可在 `Sample` 菜单切换内存分量或资源数量；标签筛选使用原生 pprof 的 `tagfocus`。
+- 同目录完成清单证明资源驻留指标全部未采集时，浏览器在详情及已打开会话中显示中文说明，并默认打开资源数量；只有清单中的 SHA256 与实际 profile 一致才启用此行为，原始 profile 默认指标保持不变。
 - 可清除当前页签下已启动的 pprof 进程。
 
 扫描会识别以下文件：

@@ -491,6 +491,7 @@ function renderProfileDetail() {
 
   profileDetail.innerHTML = `
     <div class="detail-name">${escapeHtml(profile.name)}</div>
+    ${profile.metricNotice ? `<p class="metric-notice" role="note">${escapeHtml(profile.metricNotice)}</p>` : ""}
     <dl>
       <dt>大小</dt>
       <dd>${formatSize(profile.size)}</dd>
@@ -539,6 +540,7 @@ function renderSessions() {
         <a class="session-item" href="${escapeHtml(session.url)}" target="_blank" rel="noreferrer">
           <span>${escapeHtml(session.url)}</span>
           <small>${escapeHtml(session.path)}</small>
+          ${session.metricNotice ? `<strong class="metric-notice">${escapeHtml(session.metricNotice)}</strong>` : ""}
         </a>
       `,
     )
