@@ -59,6 +59,14 @@ Linux/macOS:
 PPROF_FOLDER_BROWSER_ADDR=127.0.0.1:18080 go run .
 ```
 
+## 版本与启动脚本
+
+- 版本号写在 `version.go` 的 `appVersion`（主.次.修订），改动对外行为或 API 时手工递增，并在该文件登记版本历史。
+- `./pprof-folder-browser --version` 只输出编译产物的版本；运行中的实例通过 `GET /api/version` 报告自己的版本，启动日志也会输出版本。
+- 推荐用 `bash build-run.sh` 重建并重启，脚本会依次输出并校验：源码版本 → 编译产物版本 → 运行中实例版本，三者不一致即以非零退出码失败。
+- 编译先输出到临时文件；编译失败会打印 `go build` 错误并中止，原服务保持运行，不会替换可执行文件。
+- 管线启动时同样读取运行实例的版本写入日志；没有 `/api/version` 或缺少 `PUT /api/tabs` 的旧进程会被自动重建重启。
+
 ## 构建
 
 Windows:
@@ -114,6 +122,9 @@ node --test tests/app.test.cjs
 ```
 
 ## 注意事项
+
+- 自动管线使用 `PUT /api/tabs` 和 `registrationKey` 登记产物目录；同一标识会复用原页签，连接中断后重试及服务重启均不重复创建。原有 `POST /api/tabs` 仍用于网页手动新增。
+- 升级管线时需要同时重新构建并启动本工具；旧运行版不支持上述 PUT 接口，会明确返回 HTTP 405。
 
 - 页签、目录和扫描结果会保存到用户配置目录下的 `pprof-folder-browser/state.json`，重启后会自动恢复；也可以用 `PPROF_FOLDER_BROWSER_STATE` 指定状态文件路径。
 - `pprof` 会话记录不会跨重启保留，因为对应的 `go tool pprof` 进程会在应用退出后结束。

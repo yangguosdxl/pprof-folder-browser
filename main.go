@@ -57,12 +57,13 @@ const (
 )
 
 type browserTab struct {
-	ID        string                   `json:"id"`
-	Name      string                   `json:"name"`
-	CreatedAt time.Time                `json:"createdAt"`
-	Dirs      []string                 `json:"-"`
-	Profiles  []profileFile            `json:"-"`
-	Sessions  map[string]*pprofSession `json:"-"`
+	ID              string                   `json:"id"`
+	Name            string                   `json:"name"`
+	CreatedAt       time.Time                `json:"createdAt"`
+	RegistrationKey string                   `json:"registrationKey,omitempty"`
+	Dirs            []string                 `json:"-"`
+	Profiles        []profileFile            `json:"-"`
+	Sessions        map[string]*pprofSession `json:"-"`
 }
 
 type tabSummary struct {
@@ -100,7 +101,8 @@ type addDirRequest struct {
 }
 
 type createTabRequest struct {
-	Name string `json:"name"`
+	Name            string `json:"name"`
+	RegistrationKey string `json:"registrationKey"`
 }
 
 type renameTabRequest struct {
@@ -139,11 +141,12 @@ type persistedAppState struct {
 }
 
 type persistedTab struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	CreatedAt time.Time     `json:"createdAt,omitempty"`
-	Dirs      []string      `json:"dirs"`
-	Profiles  []profileFile `json:"profiles"`
+	ID              string        `json:"id"`
+	Name            string        `json:"name"`
+	CreatedAt       time.Time     `json:"createdAt,omitempty"`
+	RegistrationKey string        `json:"registrationKey,omitempty"`
+	Dirs            []string      `json:"dirs"`
+	Profiles        []profileFile `json:"profiles"`
 }
 
 type apiError struct {
@@ -156,11 +159,18 @@ var (
 )
 
 func main() {
+	// 供 build-run.sh 校验编译产物：仅输出版本号，不加载状态也不监听端口。
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println(appVersion)
+		return
+	}
 	state := newPersistentAppState()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/version", handleVersion)
 	mux.HandleFunc("GET /api/tabs", state.handleListTabs)
 	mux.HandleFunc("POST /api/tabs", state.handleCreateTab)
+	mux.HandleFunc("PUT /api/tabs", state.handleCreateTab)
 	mux.HandleFunc("PATCH /api/tabs", state.handleRenameTab)
 	mux.HandleFunc("DELETE /api/tabs", state.handleDeleteTab)
 	mux.HandleFunc("GET /api/dirs", state.handleListDirs)
@@ -176,7 +186,7 @@ func main() {
 	mux.Handle("/", staticHandler())
 
 	addr := listenAddr()
-	log.Printf("pprof 文件浏览器已启动：http://%s", addr)
+	log.Printf("pprof 文件浏览器已启动：版本 %s，地址 http://%s", appVersion, addr)
 	log.Fatal(http.ListenAndServe(addr, logRequest(mux)))
 }
 
@@ -280,6 +290,7 @@ func appStateFromPersisted(persisted persistedAppState) *appState {
 		}
 
 		tab := newBrowserTab(id, name)
+		tab.RegistrationKey = strings.TrimSpace(persistedTab.RegistrationKey)
 		tab.CreatedAt = persistedTab.CreatedAt
 		if tab.CreatedAt.IsZero() {
 			tab.CreatedAt = legacyBase.Add(time.Duration(index) * time.Nanosecond)
@@ -370,11 +381,12 @@ func (s *appState) persistedLocked() persistedAppState {
 	tabs := make([]persistedTab, 0, len(s.tabs))
 	for _, tab := range s.tabs {
 		tabs = append(tabs, persistedTab{
-			ID:        tab.ID,
-			Name:      tab.Name,
-			CreatedAt: tab.CreatedAt,
-			Dirs:      cloneStrings(tab.Dirs),
-			Profiles:  cloneProfiles(tab.Profiles),
+			ID:              tab.ID,
+			Name:            tab.Name,
+			CreatedAt:       tab.CreatedAt,
+			RegistrationKey: tab.RegistrationKey,
+			Dirs:            cloneStrings(tab.Dirs),
+			Profiles:        cloneProfiles(tab.Profiles),
 		})
 	}
 	return persistedAppState{
@@ -414,11 +426,44 @@ func listenAddr() string {
 	return addr
 }
 
+// requestLogWriter保留实际响应状态、已写字节和写出错误，定位客户端未收到响应的阶段。
+type requestLogWriter struct {
+	http.ResponseWriter
+	status     int
+	bytes      int
+	writeError error
+}
+
+func (w *requestLogWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *requestLogWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *requestLogWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(body)
+	w.bytes += n
+	if err != nil {
+		w.writeError = err
+	}
+	return n, err
+}
+
 func logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(started).Round(time.Millisecond))
+		response := &requestLogWriter{ResponseWriter: w}
+		next.ServeHTTP(response, r)
+		log.Printf("请求 %s %s | 状态=%d | 已写字节=%d | 耗时=%s | 写出错误=%v",
+			r.Method, r.URL.RequestURI(), response.status, response.bytes,
+			time.Since(started).Round(time.Millisecond), response.writeError)
 	})
 }
 
@@ -445,18 +490,38 @@ func (s *appState) handleCreateTab(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	req.RegistrationKey = strings.TrimSpace(req.RegistrationKey)
+	if r.Method == http.MethodPut && req.RegistrationKey == "" {
+		writeError(w, http.StatusBadRequest, "幂等登记缺少registrationKey")
+		return
+	}
 
 	s.mu.Lock()
+	// 登记标识在同一把锁内查询并持久化；并发、响应丢失和重启均不会重复创建。
+	if req.RegistrationKey != "" {
+		for _, existing := range s.tabs {
+			if existing.RegistrationKey == req.RegistrationKey {
+				responseTab := cloneTab(existing)
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"tab": responseTab})
+				return
+			}
+		}
+	}
 	tabNumber := s.nextTabNumber
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		name = fmt.Sprintf("%s %d", defaultTabNameBase, tabNumber)
 	}
 	tab := newBrowserTab(fmt.Sprintf("tab-%d", tabNumber), name)
+	tab.RegistrationKey = req.RegistrationKey
 	s.nextTabNumber++
 	s.tabs = append(s.tabs, tab)
 	responseTab := cloneTab(tab)
 	if err := s.saveLocked(); err != nil {
+		// 保存失败不保留内存中的半成品，否则后续重试会误确认尚未落盘的页签。
+		s.tabs = s.tabs[:len(s.tabs)-1]
+		s.nextTabNumber = tabNumber
 		s.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存状态失败：%v", err))
 		return
@@ -1538,6 +1603,11 @@ func publicHostFromRequest(r *http.Request) string {
 func stableID(value string) string {
 	sum := sha1.Sum([]byte(strings.ToLower(value)))
 	return hex.EncodeToString(sum[:])
+}
+
+// handleVersion 返回运行中实例的版本，供启动脚本和管线识别常驻的旧进程。
+func handleVersion(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"version": appVersion})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
